@@ -4,7 +4,7 @@ Used for accuracy / agreement / byte experiments and tests. The multi-process ru
 from __future__ import annotations
 
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 
 import numpy as np
 
@@ -80,10 +80,17 @@ def run_two_level(stream, cfg: dict, topo=None, mode: str = "full"):
     for et, tid, cam, ts, te, vec, now in _events(stream):
         site = sites[site_of[cam]]
         msgs = site.on_tracklet(tid, cam, ts, te, vec) if et == 0 else site.on_revise(tid, cam, vec)
-        for m in msgs:
+        work = deque(msgs)
+        while work:                      # site deltas; SplitRequest replies go to the front
+            m = work.popleft()
             nbytes[m[0]] += len(P.pack(m))
             nmsgs[m[0]] += 1
-            hub.handle(m)
+            back = []
+            for sid, sr in hub.handle(m):
+                nbytes[sr[0]] += len(P.pack(sr))
+                nmsgs[sr[0]] += 1
+                back.extend(sites[sid].on_split(sr[1], sr[2]))
+            work.extendleft(reversed(back))
     return {"hub": hub, "sites": sites,
             "bytes": {P.NAMES[k]: v for k, v in nbytes.items()},
             "msgs": {P.NAMES[k]: v for k, v in nmsgs.items()}}

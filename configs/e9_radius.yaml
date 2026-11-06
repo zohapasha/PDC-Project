@@ -1,0 +1,5 @@
+# accuracy vs bytes as the hub's cross-site matching radius grows (option b)
+experiment: e9
+preset: medium
+gen: {p_revise: 0.1}
+radii: [0, 10, 20, 30, 45, 1000000000]

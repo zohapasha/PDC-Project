@@ -4,11 +4,18 @@ Two-level (ours): sites send identity *changes*, never full state.
   TR  TrackletRecord  [1, tid, cam, ts, te]             every tracklet, no vector
   BT  BorderTracklet  [2, tid, cam, ts, te, vec]        border-camera tracklets only
   BR  BorderRevise    [3, tid, vec]                     final vector of a border tracklet
-  EA  EdgeAdd         [4, a, b]                         site added a tree match (a, b)
+  EA  EdgeAdd         [4, a, b, w]                      site added a tree match (a, b), score w
   ED  EdgeDel         [5, a, b]                         site removed a tree match (a, b)
-The hub embeds every site tree match as an edge of weight +inf: the site owns it, the hub
-can never cut it (ownership rule, option (a)), and site persons are always contained in
-hub (global) persons (invariant I4) by construction.
+Hub -> site:
+  SR  SplitRequest    [10, a, b]                        hub rejected site match (a, b)
+
+Ownership option (b) (default): the hub embeds site tree matches with their real scores
+and resolves conflicts exactly like a single instance. When the hub cuts or rejects a
+site-owned match whose endpoints end up in different hub persons, it sends SplitRequest;
+the site deletes (and blocks) the match and streams the resulting deltas back. Invariant
+I4 (site persons inside hub persons) holds whenever no SplitRequest is outstanding.
+Option (a) (cfg ownership="a"): site matches are +inf edges; the hub can never cut them
+and I4 holds by construction, but site mistakes cannot be corrected with global evidence.
 
 Centralized baseline (B5): sites forward everything.
   FT  FullTracklet    [6, tid, cam, ts, te, vec]
@@ -21,9 +28,10 @@ from __future__ import annotations
 import msgpack
 import numpy as np
 
-TR, BT, BR, EA, ED, FT, FR, ST, END = 1, 2, 3, 4, 5, 6, 7, 8, 9
+TR, BT, BR, EA, ED, FT, FR, ST, END, SR = 1, 2, 3, 4, 5, 6, 7, 8, 9, 10
 NAMES = {TR: "TrackletRecord", BT: "BorderTracklet", BR: "BorderRevise", EA: "EdgeAdd",
-         ED: "EdgeDel", FT: "FullTracklet", FR: "FullRevise", ST: "SiteTable", END: "End"}
+         ED: "EdgeDel", FT: "FullTracklet", FR: "FullRevise", ST: "SiteTable", END: "End",
+         SR: "SplitRequest"}
 
 
 def pack(msg) -> bytes:

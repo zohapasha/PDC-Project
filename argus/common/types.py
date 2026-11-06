@@ -27,6 +27,8 @@ class Person:
     root: int
     size: int
     visits: list                # sorted [(ts, te, cam, tid), ...]
+    tag: int = -1               # hub: site id if every member is from that site and was
+                                # joined by that site's own matches ("site-pure"); else -1
 
 
 # --------------------------------------------------------------- op-log kinds

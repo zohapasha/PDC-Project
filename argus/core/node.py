@@ -17,12 +17,13 @@ class IdentityNode:
         self.matcher = Matcher(topo, cfg["W"], cfg["tau_keep"], cams=match_cams,
                                cross_site_only=cross_site_only,
                                D_max=cfg.get("D_max", 600.0))
+        self.fixed = None                        # hub: predicate for site-owned matches
         self.max_dur = 1.0
         self._n = 0
 
-    def on_tracklet(self, tid, cam, ts, te, vec=None):
+    def on_tracklet(self, tid, cam, ts, te, vec=None, tag=-1):
         eng, m = self.engine, self.matcher
-        eng.add_vertex(tid, cam, ts, te)
+        eng.add_vertex(tid, cam, ts, te, tag)
         if te - ts > self.max_dur:
             self.max_dur = te - ts
         if vec is None or cam not in m.cams:
@@ -45,8 +46,8 @@ class IdentityNode:
         if adj is None:
             return
         for o, old in list(adj.items()):
-            if old == INF:                       # site-owned link at the hub: not a score
-                continue
+            if old == INF or (self.fixed is not None and self.fixed(tid, o)):
+                continue                         # site-owned link at the hub: site scores it
             ov = m.get(o)
             if ov is not None:
                 eng.update_match(tid, o, float(ov @ vec))

@@ -71,3 +71,47 @@ def test_walking_time():
     assert chk.feasible([(0, 5, 0, 0), (25, 30, 2, 1)])        # gap 20 >= D=20
     assert not chk.feasible([(0, 5, 0, 0), (24, 30, 2, 1)])    # gap 19 < 20
     assert not chk.feasible([(0, 5, 0, 0), (4, 6, 0, 1)])      # same camera overlap
+
+
+@st.composite
+def two_feasible_lists(draw):
+    """A long feasible list (> 16 visits, triggers windowing) and a short one."""
+    n = draw(st.integers(2, 6))
+    edges = []
+    for i in range(1, n):
+        j = draw(st.integers(0, i - 1))
+        edges.append((i, j, float(draw(st.integers(1, 40)))))
+    overlaps = [(a, b) for a, b, _ in edges if draw(st.booleans()) and draw(st.booleans())]
+    topo = make_topo(n, edges, overlaps)
+    chk = Checker(topo)
+
+    def walk(k, t0, tid0):
+        out, t, cam = [], t0, draw(st.integers(0, n - 1))
+        for i in range(k):
+            nxt = draw(st.integers(0, n - 1))
+            if out:
+                t = out[-1][1] + topo.D[cam, nxt] + draw(st.integers(0, 60))
+            d = float(draw(st.integers(1, 30)))
+            out.append((float(t), float(t) + d, nxt, tid0 + i))
+            cam = nxt
+        return out
+
+    B = walk(draw(st.integers(17, 40)), 0.0, 0)
+    A = walk(draw(st.integers(1, 4)), float(draw(st.integers(0, 2000))), 1000)
+    for v in A + B:
+        chk.note_duration(v[1] - v[0])
+    return chk, sorted(A), sorted(B)
+
+
+@settings(max_examples=2000, deadline=None)
+@given(two_feasible_lists())
+def test_windowed_can_merge_equals_all_pairs(x):
+    chk, A, B = x
+    assert chk.feasible_bruteforce(A) and chk.feasible_bruteforce(B)
+    ok, wit = chk.can_merge(A, B)
+    assert ok == chk.feasible_bruteforce(A + B)
+    if not ok:
+        va = {v[3]: v for v in A + B}
+        u, v = sorted((va[wit[0]], va[wit[1]]))
+        assert not chk.compatible(u, v)
+        assert (wit[0] < 1000) != (wit[1] < 1000)       # witness crosses the two lists

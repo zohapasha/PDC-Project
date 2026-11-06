@@ -24,8 +24,9 @@ os.makedirs(TAB, exist_ok=True)
 # validated categorical palette, fixed slot order, assigned per method (never cycled)
 STYLE = {
     "ours":              ("#2a78d6", "o", "-",  "Ours"),
-    "ours_two_level":    ("#2a78d6", "s", "--", "Ours (two-level)"),
-    "ours_two_level_a":  ("#2a78d6", "s", "--", "Ours (two-level, rule a)"),
+    "ours_two_level":    ("#2a78d6", "s", "--", "Ours (two-level, option b)"),
+    "ours_two_level_b":  ("#2a78d6", "s", "--", "Ours (two-level, option b)"),
+    "ours_two_level_a":  ("#6250d6", "<", ":",  "Ours (two-level, option a)"),
     "B1_offline":        ("#eb6834", "^", "-",  "B1 offline / full recompute"),
     "B1_full_recompute": ("#eb6834", "^", "-",  "B1 full recompute"),
     "B3_no_correction":  ("#1baf7a", "D", "-.", "B3 no correction"),
@@ -78,7 +79,8 @@ def e1():
         d = load(name)
         if d is None:
             continue
-        order = ["ours", "ours_two_level", "B1_offline", "B3_no_correction", "B4_no_constraints"]
+        order = ["ours", "ours_two_level", "ours_two_level_a", "B1_offline", "B3_no_correction",
+                 "B4_no_constraints"]
         cols = [("pw_f1", "Pairwise F1"), ("b3_f1", "B³ F1"), ("idf1", "IDF1"),
                 ("violations", "Violations"), ("agree_offline", "Agreement w/ B1")]
         rows = []
@@ -206,7 +208,8 @@ def e5():
     # message types: fixed colour per type (slot order), legend + table view in CSV
     tcol = {"bytes_BorderTracklet": "#2a78d6", "bytes_BorderRevise": "#eb6834",
             "bytes_TrackletRecord": "#1baf7a", "bytes_EdgeAdd": "#eda100", "bytes_EdgeDel": "#e87ba4",
-            "bytes_FullTracklet": "#008300", "bytes_FullRevise": "#6250d6", "bytes_SiteTable": "#e34948"}
+            "bytes_FullTracklet": "#008300", "bytes_FullRevise": "#6250d6", "bytes_SiteTable": "#e34948",
+            "bytes_SplitRequest": "#8a5a00"}
     fig, axs = plt.subplots(1, 2, figsize=(W2, 2.3), gridspec_kw={"width_ratios": [2, 2]})
     ax = axs[0]
     # composition panel: ours, B5 and the cheapest B6; all B6 periods are on the right panel
@@ -271,21 +274,63 @@ def e7():
     if d is None:
         return
     fig, axs = plt.subplots(1, 2, figsize=(W2 * 0.75, 2.2))
-    line(axs[0], d, "p_cross", "agree_centralized", "ours_two_level_a", "Two-level vs centralized")
-    axs[0].set_ylabel("Agreement (pairwise F1)")
-    for m in ("ours_two_level_a", "centralized"):
+    for m in ("ours_two_level", "ours_two_level_a"):
+        line(axs[0], d, "p_cross", "agree_centralized", m)
+    axs[0].set_ylabel("Agreement with centralized
+(pairwise F1)")
+    for m in ("centralized", "ours_two_level", "ours_two_level_a"):
         line(axs[1], d, "p_cross", "pw_f1", m)
     axs[1].set_ylabel("Pairwise F1 vs ground truth")
     for ax in axs:
         ax.set_xlabel("Cross-site movement probability")
-    axs[0].legend(loc="lower left"); axs[1].legend(loc="lower left")
-    fig.tight_layout()
+    h, l = axs[1].get_legend_handles_labels()
+    fig.tight_layout(rect=(0, 0, 1, 0.88))
+    fig.legend(h, l, loc="upper center", ncol=3, bbox_to_anchor=(0.5, 1.0))
     save(fig, "fig_e7_cross")
+
+
+# ------------------------------------------------------------------------- E9
+def e9():
+    for name in ("e9_radius", "e9_radius_hard"):
+        d = load(name)
+        if d is not None:
+            _e9(d, name)
+
+
+def _e9(d, name):
+    fig, axs = plt.subplots(1, 2, figsize=(W2 * 0.75, 2.3))
+    b = d[d.method == "ours_two_level_b"].groupby("radius")[["total_bytes", "pw_f1", "agree_centralized"]]
+    g, e = b.mean(), b.std().fillna(0)
+    c, mk, ls, lab = STYLE["ours_two_level_b"]
+    for ax, y, yl in ((axs[0], "pw_f1", "Pairwise F1 vs ground truth"),
+                      (axs[1], "agree_centralized", "Agreement with centralized")):
+        ax.errorbar(g.total_bytes / 2**20, g[y], yerr=e[y], color=c, marker=mk, ls=ls, capsize=2,
+                    elinewidth=0.8, label=lab + ", radius sweep")
+        for r, row in g.iterrows():
+            txt = "all" if r >= 1e8 else f"{r:g} s"
+            ax.annotate(txt, (row.total_bytes / 2**20, row[y]), textcoords="offset points",
+                        xytext=(3, -9), fontsize=6, color=MUTED)
+        for m in ("ours_two_level_a", "centralized"):
+            q = d[d.method == m]
+            if q.empty or (m == "centralized" and y == "agree_centralized"):
+                continue
+            cc, mm, _, ll = STYLE[m]
+            ax.errorbar([q.total_bytes.mean() / 2**20], [q[y].mean()], yerr=[q[y].std()],
+                        color=cc, marker=mm, ls="none", capsize=2, label=ll + (" (B5 bytes)" if m == "centralized" else ""))
+        ax.set_xlabel("Data sent site ↔ hub (MiB)")
+        ax.set_ylabel(yl)
+    h, l = axs[0].get_legend_handles_labels()
+    fig.tight_layout(rect=(0, 0, 1, 0.86))
+    fig.legend(h, l, loc="upper center", ncol=3, bbox_to_anchor=(0.5, 1.0))
+    save(fig, f"fig_{name}")
+    tab = d.groupby(["method", "radius"], dropna=False)[["vector_cams", "total_bytes", "pw_f1", "idf1",
+                                                          "agree_centralized", "split_requests"]].mean()
+    tab.to_csv(os.path.join(TAB, f"{name}.csv"))
 
 
 if __name__ == "__main__":
     sys.stdout.reconfigure(encoding="utf-8")
-    for f in (e1, e2, e3, e4, e5, e6, e7):
+    for f in (e1, e2, e3, e4, e5, e6, e7, e9):
         try:
             f()
         except Exception as ex:          # one broken figure should not block the others

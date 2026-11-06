@@ -34,8 +34,18 @@ def get_stream(p: dict, seed: int) -> Stream:
     """Real-data configs give `stream: path.parquet` (prepared by scripts/prepare_real.py);
     otherwise the synthetic generator is used with the given seed."""
     if p.get("stream"):
-        return Stream.load(p["stream"])
-    return load_or_generate(gen_cfg(p, seed))
+        return _radius(Stream.load(p["stream"]), p)
+    return _load(gen_cfg(p, seed), p)
+
+
+def _radius(s: Stream, p: dict) -> Stream:
+    r = float(p.get("border_radius", 0.0))
+    return s.with_topology(s.topo.with_border_radius(r)) if r > 0 else s
+
+
+def _load(g, p: dict) -> Stream:
+    """Synthetic stream with the config's hub matching radius applied to its topology."""
+    return _radius(load_or_generate(g), p)
 
 
 def eng_cfg(p: dict) -> dict:
@@ -80,11 +90,14 @@ def e1_accuracy(p, seed):
     n3, _ = run_single(s, cfg, mode="no_correction")
     rows.append({"method": "B3_no_correction", **base, **_acc_row(n3.engine.partition(), s, chk, ref)})
     if s.topo.n_sites > 1:
-        tl = run_two_level(s, cfg)
-        part = tl["hub"].eng.partition()
-        r = _acc_row(part, s, chk, ref)
-        r["agree_centralized"] = agreement(part, eng.partition())
-        rows.append({"method": "ours_two_level", **base, **r})
+        for own, name in (("b", "ours_two_level"), ("a", "ours_two_level_a")):
+            tl = run_two_level(s, dict(cfg, ownership=own))
+            part = tl["hub"].eng.partition()
+            r = _acc_row(part, s, chk, ref)
+            r["agree_centralized"] = agreement(part, eng.partition())
+            r["split_requests"] = tl["hub"].n_split
+            r["total_bytes"] = sum(tl["bytes"].values())
+            rows.append({"method": name, **base, **r})
     return rows
 
 
@@ -92,7 +105,7 @@ def e1_accuracy(p, seed):
 def e2_incremental(p, seed):
     """Per-update latency of ours vs. the cost of one full recomputation (B1) at the same
     graph size."""
-    s = load_or_generate(gen_cfg(p, seed))
+    s = _load(gen_cfg(p, seed), p)
     cfg = eng_cfg(p)
     cps = [c for c in p.get("checkpoints", [1000, 2000, 5000, 10000, 20000, 50000, 100000, 200000])
            if c <= s.n_tracklets]
@@ -120,7 +133,7 @@ def e2_incremental(p, seed):
 def e3_corrections(p, seed):
     """Per-correction cost: ours (subtree + backup links) vs B2 (component rebuild).
     Returns summary rows; per-op rows are written to results/e3_ops_<seed>.parquet."""
-    s = load_or_generate(gen_cfg(p, seed))
+    s = _load(gen_cfg(p, seed), p)
     cfg = eng_cfg(p)
     op_rate = p.get("op_rate", 0.0)
     rows, ops = [], []
@@ -169,7 +182,7 @@ def e4_scaling(p, seed):
                         n_people=p.get("people_per_site", 250) * n_sites)
         else:
             g = replace(gen_cfg(p, seed), n_sites=n_sites)
-        s = load_or_generate(g)
+        s = _load(g, p)
         path = f"data/cache/synth_{g.key()}.parquet"
         for method in p.get("methods", ["two_level", "central"]):
             for speed_name, speed in (("max", None), ("fixed", p.get("speed", 20.0))):
@@ -186,13 +199,15 @@ def e4_scaling(p, seed):
                     "hub_rss_mb": r["hub"]["rss_peak"] / 2**20,
                     "site_rss_mb_max": max(x["rss_peak"] for x in r["sites"]) / 2**20,
                     "hub_msgs": r["hub"]["n_msgs"],
+                    "split_requests": r["hub"].get("n_split", 0),
+                    "sr_bytes": r["hub"].get("sr_bytes", 0),
                 })
     return rows
 
 
 # ============================================================================ E5
 def e5_bytes(p, seed):
-    s = load_or_generate(gen_cfg(p, seed))
+    s = _load(gen_cfg(p, seed), p)
     cfg = eng_cfg(p)
     rows = []
     tl = run_two_level(s, cfg)
@@ -215,7 +230,7 @@ def e6_noise(p, seed):
     for sigma in p.get("sigmas", [0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]):
         q = dict(p)
         q["gen"] = dict(p.get("gen", {}), sigma=sigma)
-        s = load_or_generate(gen_cfg(q, seed))
+        s = _load(gen_cfg(q, seed), q)
         cfg = eng_cfg(q)
         chk = Checker(s.topo)
         dur_min = s.meta["gen"]["duration"] / 60.0
@@ -239,28 +254,54 @@ def e7_cross(p, seed):
     for pc in p.get("p_cross", [0.05, 0.1, 0.2, 0.3, 0.4, 0.5]):
         q = dict(p)
         q["gen"] = dict(p.get("gen", {}), p_cross=pc)
-        s = load_or_generate(gen_cfg(q, seed))
+        s = _load(gen_cfg(q, seed), q)
         cfg = eng_cfg(q)
         chk = Checker(s.topo)
         node, _ = run_single(s, cfg)
         central = node.engine.partition()
-        t0 = time.perf_counter()
-        tl = run_two_level(s, cfg)
-        dt = time.perf_counter() - t0
-        hub = tl["hub"].eng
-        part = hub.partition()
-        dur = s.meta["gen"]["duration"]
-        hub_ops = len(hub.oplog)
-        rows.append({"p_cross": pc, "method": "ours_two_level_a", **_stream_info(s),
-                     **_acc_row(part, s, chk), "agree_centralized": agreement(part, central),
-                     "hub_msgs_per_stream_s": sum(tl["msgs"].values()) / dur,
-                     "hub_ops_per_stream_s": hub_ops / dur,
-                     "hub_cross_cuts": sum(1 for o in hub.oplog if o[0] == K_CONFLICT_OK),
-                     "total_bytes": sum(tl["bytes"].values()), "sim_wall_s": dt})
+        for own, name in (("b", "ours_two_level"), ("a", "ours_two_level_a")):
+            t0 = time.perf_counter()
+            tl = run_two_level(s, dict(cfg, ownership=own))
+            dt = time.perf_counter() - t0
+            hub = tl["hub"].eng
+            part = hub.partition()
+            dur = s.meta["gen"]["duration"]
+            rows.append({"p_cross": pc, "method": name, **_stream_info(s),
+                         **_acc_row(part, s, chk), "agree_centralized": agreement(part, central),
+                         "hub_msgs_per_stream_s": sum(tl["msgs"].values()) / dur,
+                         "hub_ops_per_stream_s": len(hub.oplog) / dur,
+                         "hub_cross_cuts": sum(1 for o in hub.oplog if o[0] == K_CONFLICT_OK),
+                         "split_requests": tl["hub"].n_split,
+                         "total_bytes": sum(tl["bytes"].values()), "sim_wall_s": dt})
         rows.append({"p_cross": pc, "method": "centralized", **_stream_info(s), **_acc_row(central, s, chk),
                      "agree_centralized": 1.0})
     return rows
 
 
+# ============================================================================ E9
+def e9_radius(p, seed):
+    """Accuracy vs bytes as the hub's cross-site matching radius grows (option b), with
+    option (a) at radius 0 and the centralized instance as references."""
+    base_s = load_or_generate(gen_cfg(p, seed))
+    cfg = eng_cfg(p)
+    chk = Checker(base_s.topo)
+    central = run_single(base_s, cfg)[0].engine.partition()
+    rows = [{"method": "centralized", "radius": float("nan"), **_stream_info(base_s),
+             **_acc_row(central, base_s, chk), "agree_centralized": 1.0,
+             "total_bytes": sum(run_centralized_hub(base_s, cfg)["bytes"].values())}]
+    for own in ("a", "b"):
+        for r in (p.get("radii", [0, 10, 20, 30, 45, 1e9]) if own == "b" else [0]):
+            s = base_s.with_topology(base_s.topo.with_border_radius(r))
+            tl = run_two_level(s, dict(cfg, ownership=own))
+            part = tl["hub"].eng.partition()
+            rows.append({"method": f"ours_two_level_{own}", "radius": float(r), **_stream_info(s),
+                         "vector_cams": int(s.topo.border.sum()),
+                         **_acc_row(part, s, chk), "agree_centralized": agreement(part, central),
+                         "split_requests": tl["hub"].n_split,
+                         "total_bytes": sum(tl["bytes"].values()),
+                         **{f"bytes_{k}": v for k, v in tl["bytes"].items()}})
+    return rows
+
+
 EXPERIMENTS = {"e1": e1_accuracy, "e2": e2_incremental, "e3": e3_corrections, "e4": e4_scaling,
-               "e5": e5_bytes, "e6": e6_noise, "e7": e7_cross}
+               "e5": e5_bytes, "e6": e6_noise, "e7": e7_cross, "e9": e9_radius}

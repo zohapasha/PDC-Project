@@ -22,7 +22,6 @@ Modes
 """
 from __future__ import annotations
 
-import heapq
 import os
 import time
 
@@ -141,13 +140,14 @@ class IdentityEngine:
         return pid
 
     # ================================================================ public API
-    def add_vertex(self, tid: int, cam: int, ts: float, te: float):
+    def add_vertex(self, tid: int, cam: int, ts: float, te: float, tag: int = -1):
         if tid in self.V:
             return
         pid = self._next_pid
         self._next_pid += 1
         self.V[tid] = Vertex(tid, cam, ts, te, person=pid)
-        self.P[pid] = Person(pid, tid, 1, [(ts, te, cam, tid)])
+        self.P[pid] = Person(pid, tid, 1, [(ts, te, cam, tid)], tag)
+        self.chk.note_duration(te - ts)
         self.adj[tid] = {}
         if self.emit_belongs:
             self.out.append(("B", tid, -1, pid))
@@ -181,6 +181,8 @@ class IdentityEngine:
         if va.parent == b or vb.parent == a:
             if w >= self.tau_accept:
                 (va if va.parent == b else vb).pw = w
+                if self.emit:                     # weight change of a tree match
+                    self.out.append(("w", a, b, w))
             else:
                 self._demote(a, b)
         elif va.backups and b in va.backups:
@@ -232,7 +234,12 @@ class IdentityEngine:
             return True
         A, B = self.P[va.person], self.P[vb.person]
         size = A.size + B.size
-        ok, conf = self.chk.can_merge(A.visits, B.visits)
+        if A.tag >= 0 and A.tag == B.tag:
+            # both persons lie inside one site person (site-pure, joined by that site's
+            # matches): the union is a subset of a feasible set -> feasible, no check
+            ok = True
+        else:
+            ok, conf = self.chk.can_merge(A.visits, B.visits)
         if ok:
             self._merge(a, b, w)
             self._commit(K_MERGE, size)
@@ -257,8 +264,10 @@ class IdentityEngine:
             self._pend.append(("+", a, b, w))
         s.send(a, RELABEL, B.pid)
         s.run()
-        B.visits = list(heapq.merge(A.visits, B.visits))
+        B.visits = sorted(A.visits + B.visits)    # timsort: linear merge of two runs, in C
         B.size += A.size
+        if B.tag != A.tag:
+            B.tag = -1
         del P[A.pid]
 
     def _path_min(self, u, v):
@@ -362,13 +371,13 @@ class IdentityEngine:
         newpid = self._new_pid()
         nS = len(S)
         if nS <= Pobj.size - nS:
-            P[newpid] = Person(newpid, c, nS, Svis)
+            P[newpid] = Person(newpid, c, nS, Svis, Pobj.tag)
             Pobj.size -= nS
             Pobj.visits = Rvis
             s.send(c, RELABEL, newpid)
         else:
             rest_root = Pobj.root
-            P[newpid] = Person(newpid, rest_root, Pobj.size - nS, Rvis)
+            P[newpid] = Person(newpid, rest_root, Pobj.size - nS, Rvis, Pobj.tag)
             Pobj.root, Pobj.size, Pobj.visits = c, nS, Svis
             s.send(rest_root, RELABEL, newpid)
         s.run()
@@ -446,7 +455,7 @@ class IdentityEngine:
         Pobj.visits = sorted(vis_of[t] for t in first)
         for comp in comps[1:]:
             npid = self._new_pid()
-            P[npid] = Person(npid, comp[0], len(comp), sorted(vis_of[t] for t in comp))
+            P[npid] = Person(npid, comp[0], len(comp), sorted(vis_of[t] for t in comp), Pobj.tag)
             for t in comp:
                 if t not in self._relabel:
                     self._relabel[t] = V[t].person
@@ -459,7 +468,7 @@ class IdentityEngine:
         vs, ps = {}, {}
         for pid in set(pids):
             Pobj = P[pid]
-            ps[pid] = (Pobj.root, Pobj.size, Pobj.visits)
+            ps[pid] = (Pobj.root, Pobj.size, Pobj.visits, Pobj.tag)
             for vis in Pobj.visits:
                 vx = V[vis[3]]
                 vs[vx.tid] = (vx.person, vx.parent, vx.pw, list(vx.children),
@@ -475,8 +484,8 @@ class IdentityEngine:
             vx = V[t]
             vx.person, vx.parent, vx.pw, vx.children, vx.backups = (
                 person, parent, pw, children, backups)
-        for pid, (root, size, visits) in ps.items():
-            P[pid] = Person(pid, root, size, visits)
+        for pid, (root, size, visits, tag) in ps.items():
+            P[pid] = Person(pid, root, size, visits, tag)
         self._pend = []
         self._relabel = {}
 

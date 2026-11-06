@@ -69,31 +69,42 @@ def _site_main(sid, topo_json, cfg, mode, base_port, ready, start, q):
     nbytes = {}
     cpu0, w0 = _cpu(proc), time.perf_counter()
     unpack, pc = msgpack.unpackb, time.perf_counter_ns
+    def ship(t_arr, et, msgs):
+        frames = [msgpack.packb([t_arr, et])]
+        for m in msgs:
+            b = P.pack(m)
+            nbytes[m[0]] = nbytes.get(m[0], 0) + len(b)
+            frames.append(b)
+        push.send_multipart(frames)
+
+    # Player events: [etype, tid, cam, ts, te, vec]; player END: [-1].
+    # Hub messages: [-2, a, b] SplitRequest; [-3] FIN (hub has everything; exit).
     while True:
         raw = pull.recv()
         t_arr = pc()
         ev = unpack(raw)
         if ev[0] == -1:
+            push.send_multipart([msgpack.packb([-1, sid])])
+            continue
+        if ev[0] == -3:
             break
+        if ev[0] == -2:                             # SplitRequest; et=2 marks the reply
+            ship(t_arr, 2, site.on_split(ev[1], ev[2]))
+            continue
         et, tid, cam, ts, te, vb = ev
         if site is not None:
             vec = np.frombuffer(vb, np.float32)
             msgs = site.on_tracklet(tid, cam, ts, te, vec) if et == 0 else site.on_revise(tid, cam, vec)
         else:                                       # centralized: forward everything
             msgs = [[P.FT, tid, cam, ts, te, vb]] if et == 0 else [[P.FR, tid, vb]]
-        frames = [msgpack.packb([t_arr, et])]
-        for m in msgs:
-            b = P.pack(m)
-            nbytes[m[0]] = nbytes.get(m[0], 0) + len(b)
-            frames.append(b)
         lat.append(pc() - t_arr)
-        push.send_multipart(frames)
-    push.send_multipart([msgpack.packb([-1, sid])])
+        ship(t_arr, et, msgs)
     wall = time.perf_counter() - w0
     res = {"sid": sid, "site_lat_ns": np.array(lat, np.int64), "bytes": nbytes,
            "rss_peak": rss.stop(), "cpu_s": _cpu(proc) - cpu0, "wall_s": wall}
     if site is not None:
         res["oplog"] = site.node.engine.oplog
+        res["partition"] = site.node.engine.partition()
     q.put(("site", res))
     time.sleep(0.2)
     push.close(linger=-1)                           # never drop the END marker
@@ -112,6 +123,11 @@ def _hub_main(n_sites, topo_json, cfg, mode, base_port, ready, start, q):
     pull = ctx.socket(zmq.PULL)
     pull.bind(f"tcp://127.0.0.1:{base_port + _HUB_PORT}")
     hub = Hub(topo, cfg) if mode == "two_level" else CentralHub(topo, cfg)
+    to_site = []
+    for sid in range(n_sites):
+        so = ctx.socket(zmq.PUSH)
+        so.connect(f"tcp://127.0.0.1:{base_port + 2 + sid}")
+        to_site.append(so)
     rss = _RSS()
     proc = psutil.Process()
     ready.set()
@@ -119,10 +135,13 @@ def _hub_main(n_sites, topo_json, cfg, mode, base_port, ready, start, q):
     lat = []
     ended = 0
     n_msgs = 0
+    outstanding = 0                                 # SplitRequests not yet answered
+    sr_bytes = 0
     cpu0, w0 = _cpu(proc), time.perf_counter()
     t_first = None
     unpack, pc = P.unpack, time.perf_counter_ns
-    while ended < n_sites:
+    split = mode == "two_level"
+    while ended < n_sites or outstanding > 0:
         frames = pull.recv_multipart()
         head = msgpack.unpackb(frames[0])
         if head[0] == -1:
@@ -130,10 +149,20 @@ def _hub_main(n_sites, topo_json, cfg, mode, base_port, ready, start, q):
             continue
         if t_first is None:
             t_first = pc()
+        if head[1] == 2:
+            outstanding -= 1
         for b in frames[1:]:
-            hub.handle(unpack(b))
+            back = hub.handle(unpack(b))
+            if split and back:
+                for sid, sr in back:
+                    sr_bytes += len(P.pack(sr))
+                    to_site[sid].send(msgpack.packb([-2, sr[1], sr[2]]))
+                    outstanding += 1
         n_msgs += len(frames) - 1
-        lat.append((pc() - head[0], head[1]))
+        if head[1] != 2:
+            lat.append((pc() - head[0], head[1]))
+    for so in to_site:
+        so.send(msgpack.packb([-3]))
     t_end = pc()
     wall = time.perf_counter() - w0
     eng = hub.eng
@@ -141,8 +170,11 @@ def _hub_main(n_sites, topo_json, cfg, mode, base_port, ready, start, q):
            "e2e_etype": np.array([x[1] for x in lat], np.int8),
            "t_end_ns": t_end, "t_first_ns": t_first, "n_msgs": n_msgs,
            "rss_peak": rss.stop(), "cpu_s": _cpu(proc) - cpu0, "wall_s": wall,
-           "partition": eng.partition(), "oplog": eng.oplog}
+           "partition": eng.partition(), "oplog": eng.oplog,
+           "n_split": getattr(hub, "n_split", 0), "sr_bytes": sr_bytes}
     q.put(("hub", res))
+    for so in to_site:
+        so.close(linger=-1)
     pull.close()
     ctx.term()
 

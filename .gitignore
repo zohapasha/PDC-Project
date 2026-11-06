@@ -8,3 +8,4 @@ results/*.parquet
 results/logs/
 *.npy
 *.mp4
+.venv-feat/

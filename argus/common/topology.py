@@ -21,9 +21,11 @@ class Topology:
     entrance: np.ndarray               # bool per camera: building entrance
     site_of_building: np.ndarray       # logical site per building
     edges: list = field(default_factory=list)   # (c1, c2, walk_time) raw corridor graph
+    border_radius: float = 0.0         # hub matches cross-site on cams within this walking
+                                       # time of a cross-site entrance (0 = entrances only)
     # derived
     site: np.ndarray = None            # site per camera
-    border: np.ndarray = None          # bool per camera: entrance linked to another site
+    border: np.ndarray = None          # bool per camera: sends vectors to the hub
 
     def __post_init__(self):
         self.D = np.asarray(self.D, dtype=np.float64)
@@ -36,6 +38,8 @@ class Topology:
         for c1, c2, _ in self.edges:
             if self.site[c1] != self.site[c2]:
                 self.border[c1] = self.border[c2] = True
+        if self.border_radius > 0 and self.border.any():
+            self.border = (self.D[:, self.border] <= self.border_radius).any(axis=1)
         self.n_sites = int(self.site.max()) + 1 if self.n_cams else 0
 
     # ------------------------------------------------------------------ helpers
@@ -46,14 +50,18 @@ class Topology:
     def resite(self, site_of_building) -> "Topology":
         """Same physical campus, different logical split into sites (strong scaling)."""
         return Topology(self.n_cams, self.D, self.group, self.building, self.entrance,
-                        np.asarray(site_of_building), list(self.edges))
+                        np.asarray(site_of_building), list(self.edges), self.border_radius)
+
+    def with_border_radius(self, r: float) -> "Topology":
+        return Topology(self.n_cams, self.D, self.group, self.building, self.entrance,
+                        self.site_of_building, list(self.edges), float(r))
 
     def to_json(self) -> str:
         return json.dumps({
             "n_cams": self.n_cams, "D": self.D.tolist(), "group": self.group.tolist(),
             "building": self.building.tolist(), "entrance": self.entrance.tolist(),
             "site_of_building": self.site_of_building.tolist(),
-            "edges": [list(e) for e in self.edges],
+            "edges": [list(e) for e in self.edges], "border_radius": self.border_radius,
         })
 
     @staticmethod
@@ -61,7 +69,8 @@ class Topology:
         d = json.loads(s)
         return Topology(d["n_cams"], np.array(d["D"]), np.array(d["group"]),
                         np.array(d["building"]), np.array(d["entrance"]),
-                        np.array(d["site_of_building"]), [tuple(e) for e in d["edges"]])
+                        np.array(d["site_of_building"]), [tuple(e) for e in d["edges"]],
+                        float(d.get("border_radius", 0.0)))
 
 
 def shortest_paths(n: int, edges, overlap_pairs=()) -> tuple[np.ndarray, np.ndarray]:
