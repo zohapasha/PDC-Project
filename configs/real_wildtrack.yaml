@@ -1,0 +1,6 @@
+# E1 on WILDTRACK (GT boxes -> tracklets, OSNet-AIN MSMT17 features, train-mean centered).
+# Built by scripts/extract_features.py + scripts/prepare_real.py --sites "0,1,2,3;4,5,6".
+# tau_accept chosen on the training split (first 100 s) and frozen for test (last 100 s).
+experiment: e1
+stream: data/real/wildtrack_test.parquet
+engine: {tau_accept: 0.5, tau_keep: 0.5}

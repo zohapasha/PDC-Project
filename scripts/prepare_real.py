@@ -37,6 +37,9 @@ if __name__ == "__main__":
     ap.add_argument("--gap", type=float, default=1.0)
     ap.add_argument("--p_frag", type=float, default=0.0)
     ap.add_argument("--train_frac", type=float, default=0.5)
+    ap.add_argument("--no_center", action="store_true",
+                    help="skip mean-centering (OSNet features are non-negative after ReLU, "
+                         "which inflates every cosine; the mean is estimated on train only)")
     ap.add_argument("--out", required=True)
     a = ap.parse_args()
 
@@ -65,6 +68,12 @@ if __name__ == "__main__":
     tr_idx = np.nonzero(tr.t_end.to_numpy() <= t_cut)[0]
     te_idx = np.nonzero(tr.t_start.to_numpy() > t_cut)[0]
     topo = T.estimate_topology(tr.iloc[tr_idx], n_cams, site)
+    if not a.no_center:
+        mu = vec[tr_idx].mean(0)
+        unit = lambda x: (x / np.linalg.norm(x, axis=1, keepdims=True)).astype(np.float32)
+        vec = unit(vec - mu)
+        if prov is not None:
+            prov = unit(prov - mu)
     for name, idx in (("train", tr_idx), ("test", te_idx)):
         sub = tr.iloc[idx].reset_index(drop=True)
         s = T.to_stream(sub, vec[idx], topo, fps, None if prov is None else prov[idx])

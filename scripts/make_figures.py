@@ -276,8 +276,7 @@ def e7():
     fig, axs = plt.subplots(1, 2, figsize=(W2 * 0.75, 2.2))
     for m in ("ours_two_level", "ours_two_level_a"):
         line(axs[0], d, "p_cross", "agree_centralized", m)
-    axs[0].set_ylabel("Agreement with centralized
-(pairwise F1)")
+    axs[0].set_ylabel("Agreement with centralized\n(pairwise F1)")
     for m in ("centralized", "ours_two_level", "ours_two_level_a"):
         line(axs[1], d, "p_cross", "pw_f1", m)
     axs[1].set_ylabel("Pairwise F1 vs ground truth")

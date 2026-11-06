@@ -7,14 +7,15 @@ Every tracklet is a vertex. Accepted matches inside a person form one tree, with
 accepted matches kept as *backup links*. Merges, conflict resolution and deletions are
 vertex programs that touch only the persons involved. Each site runs this engine on its
 own cameras and streams only the **changes** to a hub. The hub runs the **same engine**
-to build the central (global) graph.
+to build the central (global) graph, and sends a `SplitRequest` back when global
+evidence shows a site match is wrong.
 
 ## Install
 
 ```bash
 uv venv .venv --python 3.12          # or: python -m venv .venv
 uv pip install -r requirements.txt    # or: pip install -r requirements.txt
-python -m pytest -q                   # 17 tests, ~10k Hypothesis cases, ~1 min
+python -m pytest -q                   # 26 tests, ~12k Hypothesis cases, ~1 min
 ```
 
 ## Reproduce every number and figure
@@ -40,7 +41,10 @@ while they run. Untimed ones (E1, E5, E6, E7) run seeds in parallel.
 | `e4_weak.yaml`, `e4_strong.yaml` | E4 scaling with sites (multi-process) | C3 | `fig_e4_{weak,strong}` |
 | `e5_bytes.yaml` | E5 bytes to hub vs B5/B6 | C3 | `fig_e5_bytes` |
 | `e6_noise.yaml` | E6 re-ID noise sweep | C1, C2 | `fig_e6_noise` |
-| `e7_cross.yaml` | E7 cross-site movement, rule (a) vs centralized | C3, C4 | `fig_e7_cross` |
+| `e7_cross.yaml` | E7 cross-site movement, option (b) / (a) vs centralized | C3, C4 | `fig_e7_cross` |
+| `e8_neo4j.yaml` | E8 Neo4j sink throughput, stored graph = hub partition | C3 | `results/e8_neo4j.csv` |
+| `e9_radius.yaml`, `e9_radius_hard.yaml` | E9 hub matching radius: bytes vs accuracy | C1, C3 | `fig_e9_radius*` |
+| `real_wildtrack.yaml` | E1 on WILDTRACK (OSNet features) | C1 | `tables/real_wildtrack` |
 
 ## Headline results (synthetic, 5 seeds, mean; 12-core / 32 GB Windows machine, 2026-11-06)
 
@@ -85,19 +89,28 @@ components without constraints, **B5** `CentralHub` (sites forward everything wi
 
 ## Where this differs from the written plan (update the Methodology section)
 
-1. **Hub protocol: site tree matches are +∞ edges at the hub.** Sites send
+1. **Hub protocol: the hub mirrors site matches and can send them back (option b).** Sites send
    `TrackletRecord` (every tracklet, no vector), `BorderTracklet`/`BorderRevise` (vectors,
-   border cameras only), and `EdgeAdd`/`EdgeDel` for every change to their match trees. The hub
-   runs the unmodified engine, with every site tree match added at weight +∞. Consequences:
-   - The hub can never cut a site-owned match, so it only ever removes the weakest
-     *cross-site* match. That is ownership rule (a), and it falls out of the weights.
-   - Every site person is always inside one global person. That is invariant I4, and it holds
-     by construction (tested).
-   - A site merge costs one `EdgeAdd` rather than |A| `BelongsTo` messages.
+   only for cameras within `border_radius` of a cross-site entrance) and
+   `EdgeAdd(a, b, score)`/`EdgeDel` for every change to their match trees. The hub runs the
+   unmodified engine on all of this, with site matches at their **real scores**. So it
+   resolves conflicts exactly as a single instance would. When it cuts or rejects a site
+   match, it sends `SplitRequest(a, b)`. The site deletes and blocks the match, then
+   streams the resulting deltas back. Invariant I4 (every site person lies inside one
+   global person) holds whenever no `SplitRequest` is outstanding. Tests cover this for the
+   in-process and the multi-process runtime.
+   - The site is authoritative for its scores: the hub never re-scores a site match, and the
+     site sends score changes as `EdgeAdd`.
+   - Option (a) (`engine: {ownership: a}`) mirrors site matches as +∞ edges. The hub then
+     never cuts them, and I4 holds by construction. But a site's mistakes (it cannot see a
+     person's visits in other buildings) become permanent. In E1-hard this cost
+     0.08 pairwise F1. Option (a) is kept as an ablation (E1, E7, E9).
+   - With no cross-site candidates, two-level equals centralized exactly under both options
+     (`tests/test_equivalence.py`).
+   - Hub fast path: a merge of two *site-pure* hub persons (one site, joined only by that
+     site's matches) needs no constraint check, because the union is a subset of a feasible
+     site person.
 
-   `BelongsTo` deltas still exist (`emit_belongs=True`) and feed the Neo4j sink.
-   With 1 site the two-level result equals the centralized result exactly, and also with any
-   number of sites when no cross-site candidate exists (`tests/test_equivalence.py`).
 2. **The constraint lemma needed a fix.** "Check each pair of consecutive visits" is wrong
    once overlap groups exist. Take cam 0 then cam 1 (which overlaps cam 0) ending later, then
    cam 0 again while the first visit is still running. The latest-ending earlier visit is on
@@ -125,13 +138,17 @@ components without constraints, **B5** `CentralHub` (sites forward everything wi
    order, so it is deterministic; E1, E5 and E7 use it. `mp.py` is the real multi-process
    system used for E4. Its cross-site interleaving is nondeterministic, so the hub result
    varies slightly between runs (agreement with `sim` ≈ 0.96).
-9. **Not implemented:** option (b) `SplitRequest`, `tc netem` network delay, and E8 (Neo4j
-   throughput). The sink code exists but has not been benchmarked.
+9. **Not implemented:** `tc netem` network delay (single Windows machine; all processes talk over
+   loopback TCP). MTMMC is not run: the team has to request access. The loader assumes a
+   MOT-style layout.
 10. **IDF1 with GT boxes:** every frame belongs to exactly one tracklet, so
     IDF1 = IDTP / total frames, with IDTP taken from the optimal assignment between
     predicted and GT identities. Synthetic "frames" are duration × 10 fps. For very large
     instances, the assignment keeps only the 8 heaviest predicted IDs per GT ID, which
     gives a lower bound.
+11. **Constraint check windowing.** When merging a small person S into a large one L, only
+    L's visits within max walking time + longest visit of S's visits can conflict. The check
+    runs on that slice. This is exact (proof in `constraints.py`, tested against brute force).
 
 ## Real data (written, NOT yet run — datasets were not available here)
 
