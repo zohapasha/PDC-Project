@@ -278,6 +278,46 @@ def e7_cross(p, seed):
     return rows
 
 
+# ============================================================================ E8
+def e8_neo4j(p, seed):
+    """Persistence sink: replay the hub's BelongsTo deltas (two-level, option b) into
+    Neo4j with batched UNWIND writes; throughput per batch size, compared with the rate
+    the stream produces them; the final graph must equal the hub partition."""
+    from ..sink.neo4j_sink import Neo4jSink
+    s = get_stream(p, seed)
+    cfg = eng_cfg(p)
+    deltas = []
+    tl = run_two_level(s, cfg, on_belongs=lambda now, ds: deltas.extend(ds))
+    hub = tl["hub"].eng.partition()
+    dur = s.meta["gen"].get("duration") or float(s.te.max() - s.ts.min())
+    rows = []
+    uri, auth = p.get("uri", "bolt://localhost:7687"), tuple(p.get("auth", ["neo4j", "argus-pass"]))
+    for batch in p.get("batches", [500, 2000, 5000, 20000]):
+        sink = Neo4jSink(uri, auth, batch=batch)
+        with sink.driver.session() as ses:
+            ses.run("MATCH (n) DETACH DELETE n")
+        t0 = time.perf_counter()
+        lat = []
+        for i in range(0, len(deltas), batch):
+            t1 = time.perf_counter()
+            sink.push(deltas[i:i + batch])
+            sink.flush()
+            lat.append((time.perf_counter() - t1) * 1e3)
+        wall = time.perf_counter() - t0
+        with sink.driver.session() as ses:
+            got = {r["tid"]: r["pid"] for r in ses.run(
+                "MATCH (t:Tracklet)-[:BELONGS_TO]->(p:Person) RETURN t.tid AS tid, p.pid AS pid")}
+            n_rel = ses.run("MATCH (:Tracklet)-[r:BELONGS_TO]->() RETURN count(r) AS c").single()["c"]
+        sink.close()
+        rows.append({"method": "ours_two_level", "batch": batch, **_stream_info(s),
+                     "n_deltas": len(deltas), "deltas_per_stream_s": len(deltas) / dur,
+                     "sink_deltas_per_s": len(deltas) / wall, "sink_wall_s": wall,
+                     "headroom": (len(deltas) / wall) / (len(deltas) / dur),
+                     **{f"flush_ms_{k}": v for k, v in _pct(lat).items()},
+                     "graph_equals_hub": bool(got == hub), "n_belongs_rel": int(n_rel)})
+    return rows
+
+
 # ============================================================================ E9
 def e9_radius(p, seed):
     """Accuracy vs bytes as the hub's cross-site matching radius grows (option b), with
@@ -304,4 +344,4 @@ def e9_radius(p, seed):
 
 
 EXPERIMENTS = {"e1": e1_accuracy, "e2": e2_incremental, "e3": e3_corrections, "e4": e4_scaling,
-               "e5": e5_bytes, "e6": e6_noise, "e7": e7_cross, "e9": e9_radius}
+               "e5": e5_bytes, "e6": e6_noise, "e7": e7_cross, "e8": e8_neo4j, "e9": e9_radius}

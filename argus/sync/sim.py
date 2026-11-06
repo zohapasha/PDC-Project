@@ -68,12 +68,12 @@ def _operator_correction(eng, gt, rng):
         eng.remove_match(a, b, block=True)
 
 
-def run_two_level(stream, cfg: dict, topo=None, mode: str = "full"):
+def run_two_level(stream, cfg: dict, topo=None, mode: str = "full", on_belongs=None):
     """N sites + hub, messages delivered immediately in stream order (deterministic).
     Returns dict with hub, sites, bytes per message type, message counts."""
     topo = topo or stream.topo
     sites = [Site(topo, s, cfg, mode=mode) for s in range(topo.n_sites)]
-    hub = Hub(topo, cfg)
+    hub = Hub(topo, cfg, emit_belongs=on_belongs is not None)
     nbytes = defaultdict(int)
     nmsgs = defaultdict(int)
     site_of = topo.site
@@ -91,6 +91,9 @@ def run_two_level(stream, cfg: dict, topo=None, mode: str = "full"):
                 nmsgs[sr[0]] += 1
                 back.extend(sites[sid].on_split(sr[1], sr[2]))
             work.extendleft(reversed(back))
+        if on_belongs is not None and hub.eng.out:   # BelongsTo deltas for a sink
+            on_belongs(now, [d for d in hub.eng.out if d[0] == "B"])
+            hub.eng.out = []
     return {"hub": hub, "sites": sites,
             "bytes": {P.NAMES[k]: v for k, v in nbytes.items()},
             "msgs": {P.NAMES[k]: v for k, v in nmsgs.items()}}

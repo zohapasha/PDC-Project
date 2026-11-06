@@ -1,0 +1,6 @@
+# Neo4j persistence sink throughput (docker run -d --name argus-neo4j -p 7687:7687
+#   -e NEO4J_AUTH=neo4j/argus-pass neo4j:5)
+experiment: e8
+preset: medium
+gen: {p_revise: 0.1}
+batches: [500, 2000, 5000, 20000]

@@ -22,8 +22,11 @@ from __future__ import annotations
 import numpy as np
 
 
-def make_extractor(model_name: str = "osnet_x1_0", weights: str | None = None, device: str = "cuda"):
-    from torchreid.utils import FeatureExtractor
+def make_extractor(model_name: str = "osnet_ain_x1_0", weights: str | None = None, device: str = "cuda"):
+    try:
+        from torchreid.utils import FeatureExtractor          # GitHub deep-person-reid
+    except ImportError:
+        from torchreid.reid.utils import FeatureExtractor     # PyPI torchreid 0.2.x
     return FeatureExtractor(model_name=model_name, model_path=weights or "", device=device)
 
 
