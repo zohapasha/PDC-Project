@@ -1,0 +1,6 @@
+method,bytes_BorderTracklet,bytes_EdgeAdd,bytes_BorderRevise,bytes_TrackletRecord,bytes_EdgeDel,bytes_FullTracklet,bytes_FullRevise,bytes_SiteTable,total_bytes,staleness_s
+ours,7308661.4,365295.0,688254.8,774994.6,46456.6,,,,9183662.4,0.0
+B5_centralized,,,,,,24718156.0,2369082.2,,27087238.2,0.0
+B6_periodic_T1,7308661.4,,688254.8,,,,,456412875.0,464409791.2,0.4999859484944844
+B6_periodic_T5,7308661.4,,688254.8,,,,,91456854.4,99453770.6,2.5029768890614514
+B6_periodic_T30,7308661.4,,688254.8,,,,,15386256.8,23383173.0,14.954571731774752

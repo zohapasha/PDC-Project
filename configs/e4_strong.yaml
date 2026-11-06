@@ -1,0 +1,7 @@
+experiment: e4
+kind: strong
+preset: medium
+gen: {n_buildings: 8, cams_per_building: 4, n_people: 2000, duration: 1800.0, p_revise: 0.1}
+sites: [1, 2, 4, 8]
+speed: 50.0
+methods: [two_level, central]

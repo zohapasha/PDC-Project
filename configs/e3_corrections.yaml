@@ -1,0 +1,5 @@
+# many corrections: look-alikes, score revisions, simulated operator deletions
+experiment: e3
+preset: medium
+gen: {p_revise: 0.3, lookalike_frac: 0.25, sigma: 0.6}
+op_rate: 2.0          # operator corrections per minute

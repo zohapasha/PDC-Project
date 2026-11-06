@@ -1,0 +1,20 @@
+[project]
+name = "argus"
+version = "0.1.0"
+description = "ARGUS: parallel vertex-centric synchronization toward a central identity graph"
+requires-python = ">=3.11"
+dependencies = [
+  "numpy>=1.26", "pandas>=2.1", "pyarrow>=14", "pyzmq>=25", "msgpack>=1.0",
+  "pyyaml>=6", "psutil>=5.9", "matplotlib>=3.8", "scipy>=1.11",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8", "hypothesis>=6", "networkx>=3"]
+features = ["opencv-python", "torch", "torchreid"]
+
+[tool.setuptools.packages.find]
+include = ["argus*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

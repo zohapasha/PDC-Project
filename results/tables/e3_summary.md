@@ -1,0 +1,15 @@
+method                           B2_component      ours
+n_corrections                            2226      2224
+n_conflict_ok                            2187      2187
+n_conflict_rej                      7.714e+04 7.714e+04
+n_deletions                               145       145
+frac_del_hit_backup                    0.7298    0.7407
+frac_treedel_repaired_by_backup        0.7015    0.6903
+touched_mean                             24.2     16.46
+touched_over_size_max                       1         1
+msgs_mean                                 679     200.8
+corr_us_p50                             705.4     228.9
+corr_us_p99                         2.254e+04      3537
+tree_depth_mean                         6.557     6.452
+tree_depth_max                           23.8      23.6
+pw_f1                                  0.9094    0.9091

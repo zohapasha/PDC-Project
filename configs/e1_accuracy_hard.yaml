@@ -1,0 +1,4 @@
+# harder re-ID: more look-alikes, noisier vectors, more provisional vectors
+experiment: e1
+preset: medium
+gen: {p_revise: 0.3, sigma: 0.7, lookalike_frac: 0.25}

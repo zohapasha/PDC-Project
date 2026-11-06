@@ -1,0 +1,4 @@
+experiment: e6
+preset: medium
+gen: {p_revise: 0.1}
+sigmas: [0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0]

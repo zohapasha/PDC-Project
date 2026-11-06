@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.hypothesis/
+data/
+results/*.parquet
+results/logs/
+*.npy
+*.mp4

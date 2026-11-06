@@ -1,0 +1,8 @@
+experiment: e4
+kind: weak
+preset: medium
+gen: {cams_per_building: 8, duration: 1800.0, p_revise: 0.1}
+people_per_site: 250
+sites: [1, 2, 4, 8]
+speed: 50.0           # fixed-load runs replay 50x real time
+methods: [two_level, central]

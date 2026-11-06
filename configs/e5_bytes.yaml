@@ -1,0 +1,4 @@
+experiment: e5
+preset: medium
+gen: {p_revise: 0.1}
+periods: [1, 5, 30]
