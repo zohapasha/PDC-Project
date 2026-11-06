@@ -327,9 +327,45 @@ def _e9(d, name):
     tab.to_csv(os.path.join(TAB, f"{name}.csv"))
 
 
+# ------------------------------------------------------------------------- E8 / E4 / real-data tables
+def _md(g, name):
+    g.to_csv(os.path.join(TAB, f"{name}.csv"))
+    with open(os.path.join(TAB, f"{name}.md"), "w", encoding="utf-8") as f:
+        f.write(g.to_string(float_format=lambda v: f"{v:.4g}"))
+    print("  table", name)
+
+
+def e8():
+    d = load("e8_neo4j")
+    if d is None:
+        return
+    cols = ["n_deltas", "deltas_per_stream_s", "sink_deltas_per_s", "headroom",
+            "flush_ms_p50", "flush_ms_p95", "flush_ms_p99", "graph_equals_hub"]
+    g = d.groupby("batch")[cols].agg(["mean", "std"])
+    g.columns = [f"{a}_{b}" for a, b in g.columns]
+    _md(g, "e8_neo4j")
+
+
+def e4_tab():
+    for kind in ("weak", "strong"):
+        d = load(f"e4_{kind}")
+        if d is None:
+            continue
+        cols = ["throughput_ev_s", "e2e_ms_p50", "e2e_ms_p99", "hub_cpu_util", "hub_msgs", "split_requests"]
+        _md(d.groupby(["load", "method", "n_sites"])[cols].mean(), f"e4_{kind}")
+
+
+def real():
+    d = load("real_wildtrack")
+    if d is None:
+        return
+    cols = [c for c in ["pw_f1", "pw_p", "pw_r", "b3_f1", "idf1", "violations", "agree_centralized"] if c in d.columns]
+    _md(d.groupby("method")[cols].mean(), "real_wildtrack")
+
+
 if __name__ == "__main__":
     sys.stdout.reconfigure(encoding="utf-8")
-    for f in (e1, e2, e3, e4, e5, e6, e7, e9):
+    for f in (e1, e2, e3, e4, e4_tab, e5, e6, e7, e8, e9, real):
         try:
             f()
         except Exception as ex:          # one broken figure should not block the others

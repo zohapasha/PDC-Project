@@ -48,20 +48,26 @@ while they run. Untimed ones (E1, E5, E6, E7) run seeds in parallel.
 
 ## Headline results (synthetic, 5 seeds, mean; 12-core / 32 GB Windows machine, 2026-11-06)
 
+Two-level = site engines plus a hub (option b, SplitRequest) unless stated otherwise. Full tables are in `results/tables/`.
+
 | Exp | Result |
 |---|---|
-| E1 (medium, ~46k tracklets) | Ours pairwise F1 **0.941**, IDF1 0.926, **0 violations**. B1 offline 0.943, B3 no-correction 0.928, B4 no-constraints 0.896 with ~367 violations. Agreement with B1: 0.989. |
-| E1 hard | Ours 0.891 vs B1 0.900, B3 0.868, B4 0.778. **Two-level only 0.809.** |
-| E2 | Per-update latency at 200k tracklets: **2.1 ms mean / 6.5 ms p99**, nearly flat with graph size. One full recompute (B1) takes 14.2 s and grows super-linearly. |
-| E3 | Corrections vs B2 (whole-person rebuild): p50 0.23 vs 0.71 ms, p99 3.5 vs 22.5 ms, 3.4× fewer vertex messages, 16 vs 24 vertices touched, identical F1. About 70% of deleted tree matches are repaired via a backup link. |
-| E4 weak | Max throughput 2.6k → 7.6k ev/s from 1 to 4 sites, then flat at 8 sites because the hub saturates (CPU ≈ 1.0). B5 centralized *drops* from 3.8k to 0.9k ev/s. Fixed-load p99 for ours stays at about 2 ms; B5 reaches 30 s at 8 sites. |
-| E4 strong | 1.2k → 5.9k ev/s (1 → 4 sites), flat after that. B5 stays at about 1.5k ev/s. p99 for ours is about 2 ms vs 1.7–5 s for B5. |
-| E5 | Bytes to hub: ours **8.8 MiB**, B5 25.8 MiB, B6 22–443 MiB (T = 30 s … 1 s), with 0.5–15 s staleness for B6. |
-| E6 | F1 stays at ≥ 0.92 up to σ = 0.7, then collapses for all methods (by σ = 0.9). Ours ≥ B3 ≥ B4 throughout. |
-| E7 | Two-level agreement with centralized falls from 0.98 to 0.94 as p_cross goes from 0.05 to 0.5. Two-level F1 is 0.91–0.92 vs centralized 0.92–0.95. |
+| E1 (medium, ~46k tracklets) | Ours pairwise F1 **0.941**, IDF1 0.926, **0 violations**. B1 offline 0.943, B3 no-correction 0.928, B4 no-constraints 0.896 with ~367 violations. Agreement with B1: 0.989. Two-level: option b 0.933, option a 0.921. |
+| E1 hard | Ours 0.891 vs B1 0.900, B3 0.868, B4 0.778. Two-level at the minimum-bytes radius: option b 0.827, option a 0.809. E9 shows this gap closing with a larger radius. |
+| E2 | Per-update latency at 200k tracklets: **3.7 ms mean / 8.6 ms p99**, growing slowly with graph size. One full recompute (B1) takes **14.3 s** and grows super-linearly. |
+| E3 | Corrections vs B2 (whole-person rebuild): p50 **0.18 vs 0.66 ms**, p99 **3.1 vs 21.8 ms**, 3.4× fewer vertex messages (201 vs 679), 16.5 vs 24.2 vertices touched, identical F1 (0.909). About 69% of deleted tree matches are repaired via a backup link. |
+| E4 weak (250 people/site) | Max throughput **3.3k → 6.7k → 7.7k ev/s** at 1 → 2 → 4 sites, then 5.9k at 8 sites because the hub saturates (CPU ≈ 1.0). B5 centralized *drops* from 5.4k to 1.2k ev/s. At fixed load (50× real time), p99 for ours stays at **1.7–9 ms**; B5 reaches **20 s** at 8 sites. |
+| E4 strong (2000 people, 32 cams) | **1.2k → 2.4k → 4.7k ev/s** (1 → 2 → 4 sites), 4.1k at 8 sites. B5 stays at 1.0–1.6k ev/s. At fixed load, p99 for ours is 2.4–5.3 ms vs 2.6–15 s for B5. SplitRequests are about 1.1–1.4k per run (~10 KB). |
+| E5 | Bytes to hub: ours **9.25 MiB** (SplitRequest 0.01 MiB), B5 25.8 MiB, B6 22–443 MiB (T = 30 s … 1 s), with 0.5–15 s staleness for B6. |
+| E6 | F1 stays at ≥ 0.92 up to σ = 0.7, then collapses for all methods (by σ = 0.9). Ours ≥ B3 ≥ B4 up to σ = 0.8. |
+| E7 | As p_cross goes from 0.05 to 0.5, agreement with centralized is 0.98 → 0.96 for option b and 0.98 → 0.94 for option a. Option b F1 is 0.916–0.943 vs centralized 0.919–0.954. |
+| E8 (Neo4j 5, batched UNWIND) | The stream produces 26 BelongsTo deltas/s (94k per run). The sink sustains **17k–40k deltas/s** (batch 500 → 20 000): 670–1500× headroom, flush p99 74–548 ms. The stored graph equals the hub partition in **5/5** runs. |
+| E9 (hub matching radius) | Normal: option b 0.933 → 0.941 F1 as bytes go from 9.2 to 26.8 MiB, matching centralized (0.941 at 25.8 MiB). Hard: 0.827 → 0.889 (centralized 0.891); 45 s radius gives 0.886 at 25.6 MiB vs 30.4 MiB centralized; 30 s gives 0.876 at 21.7 MiB. |
+| Real: WILDTRACK test (671 tracklets, 125 people) | Ours F1 0.314 / IDF1 0.540, 0 violations; B1 0.315; B3 0.305; B4 0.034 with 12 violations; two-level b 0.316 (agreement 0.994). Low absolute accuracy because association is appearance-only (see below). |
 
-Limits to report: the hub saturates beyond about 4 sites, and the two-level design loses
-accuracy compared with centralized (worse with heavy cross-site traffic or noise; see E1-hard and E7).
+Limits to report: the hub saturates beyond about 4 sites (E4). At the minimum-bytes radius the
+two-level design loses accuracy compared with centralized in the hard setting (E1-hard). Buying it
+back costs bytes (E9). Absolute accuracy on WILDTRACK is low.
 
 ## Layout
 
@@ -150,25 +156,51 @@ components without constraints, **B5** `CentralHub` (sites forward everything wi
     L's visits within max walking time + longest visit of S's visits can conflict. The check
     runs on that slice. This is exact (proof in `constraints.py`, tested against brute force).
 
-## Real data (written, NOT yet run — datasets were not available here)
+## Real data: WILDTRACK (run), MTMMC (needs access)
 
-1. Request MTMMC access. Download WILDTRACK.
-2. On Colab: build the tracklet table and extract OSNet features
-   (`argus/data/features.py` docstring). Save the `.npy` files.
-3. `python scripts/prepare_real.py wildtrack --root ... --vec ... --prov ... --out data/real/wildtrack`
-   This splits train/test in time, estimates walking times and overlap groups from train,
-   and picks `τ_accept` on train.
-4. Make a config with `experiment: e1`, `stream: data/real/wildtrack_test.parquet`, and
-   `engine: {tau_accept: <chosen>}`. Run it like the others.
-5. `python scripts/calibrate.py --real data/real/wildtrack_train.parquet`. Adjust σ until
-   the synthetic histograms roughly match the real ones, then re-run the synthetic experiments.
+```bash
+# 1. download + extract (the official zip has >4 GB offsets written without zip64;
+#    extract per entry at offset ± 2^32, every file is CRC-checked)
+# 2. OSNet-AIN x1.0 trained on all of MSMT17 (cross-domain), CPU is enough (~8 min)
+.venv-feat/Scripts/python.exe scripts/extract_features.py wildtrack     --root data/raw/Wildtrack_extract/Wildtrack_dataset --out data/real/wildtrack
+# 3. tracklets from GT boxes, temporal split 100 s train / 100 s test, walking times and
+#    overlap groups from train, features centred with the train mean, tau chosen on train
+python scripts/prepare_real.py wildtrack --root data/raw/Wildtrack_extract/Wildtrack_dataset     --vec data/real/wildtrack_vec.npy --prov data/real/wildtrack_prov.npy     --sites "0,1,2,3;4,5,6" --out data/real/wildtrack          # -> tau_accept = 0.5
+python scripts/run_experiment.py configs/real_wildtrack.yaml --seeds 0 --fresh
+```
 
-`mtmmc.load_boxes` *assumes* a MOT-format `gt/gt.txt` per camera with global IDs. Check
-this against the actual release.
+WILDTRACK test split (671 tracklets, 125 people, 7 overlapping cameras split into 2 sites):
+
+| Method | Pairwise P / R / F1 | B³ F1 | IDF1 | Violations | Agreement w/ B1 |
+|---|---|---|---|---|---|
+| Ours | 0.338 / 0.293 / **0.314** | 0.521 | 0.540 | 0 | 0.884 |
+| Ours two-level (option b) | 0.342 / 0.293 / 0.316 | 0.522 | 0.541 | 0 | 0.890 |
+| Ours two-level (option a) | 0.331 / 0.291 / 0.310 | 0.519 | 0.539 | 0 | 0.867 |
+| B1 offline | 0.340 / 0.294 / 0.315 | 0.520 | 0.536 | 0 | 1.000 |
+| B3 no correction | 0.322 / 0.289 / 0.305 | 0.518 | 0.539 | 0 | 0.717 |
+| B4 no constraints | 0.018 / 0.438 / 0.034 | 0.488 | 0.398 | 12 | 0.068 |
+
+The relative claims hold on real appearance features:
+- ours ≈ the offline optimum;
+- corrections help (B3 is lower);
+- without constraints, merges chain through the whole crowd (B4: F1 0.03, 12 physical violations);
+- two-level ≈ centralized.
+
+**Absolute accuracy is low, and the paper should say why.** WILDTRACK is one plaza seen
+by 7 overlapping cameras. Every camera pair overlaps (D = 0, one overlap group), so the
+walking-time constraints carry no information beyond "not twice on the same camera". Association
+is then appearance-only, across very different viewpoints of a dense crowd. True-match AUC of
+the centred OSNet features is 0.83 (mean cosine 0.27 for true pairs vs 0.00 for false pairs).
+Multi-view methods on WILDTRACK use ground-plane geometry, which we do not. **MTMMC** is the
+dataset that matches the setting (a multi-building campus with real walking times). Request
+access, then use `argus/data/mtmmc.py`. It *assumes* a MOT-format `gt/gt.txt` per camera
+with global IDs, so check that against the release.
 
 ## Limitations to state in the paper
 
-Python implementation on one machine. GT tracklets, not tracker output. The hub processes
-metadata for every tracklet, so it becomes the bottleneck as sites are added (see E4).
-Greedy online decisions (agreement with offline ≈ 0.99). Synthetic workloads are the main
-scaling evidence until the real-data calibration is done.
+- Python implementation on one machine. Sites and hub are separate processes over ZeroMQ, but there is no real network: we did not use `tc netem` delay or loss.
+- GT tracklets, not tracker output.
+- The hub processes metadata for every tracklet, so it saturates at about 4 sites (E4; hub CPU ≈ 1.0). Values slightly above 1.0 are BLAS threads.
+- Greedy online decisions (agreement with offline ≈ 0.99 normal, 0.98 hard).
+- Two-level vs centralized accuracy is a bytes trade-off (E9). At the cheapest radius, the hard setting loses 0.06 F1.
+- Real data: only WILDTRACK, which is small (2 × 100 s, 7 overlapping cameras) and appearance-only. MTMMC (multi-building, real walking times) is pending access. Synthetic workloads remain the main scaling evidence.
