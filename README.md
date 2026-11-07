@@ -196,6 +196,116 @@ dataset that matches the setting (a multi-building campus with real walking time
 access, then use `argus/data/mtmmc.py`. It *assumes* a MOT-format `gt/gt.txt` per camera
 with global IDs, so check that against the release.
 
+## Real data on Kaggle: NVIDIA MTMC_Tracking_2024 (AI City 2024 Track 1)
+
+Dataset: [`nvidia/PhysicalAI-SmartSpaces`](https://huggingface.co/datasets/nvidia/PhysicalAI-SmartSpaces)
+on Hugging Face, subset `MTMC_Tracking_2024`, CC-BY-4.0, no request form. It has 90
+synthetic indoor scenes (warehouses, hospitals, retail) with 7–16 cameras each, people
+with IDs that are consistent across cameras, and public ground truth for the test
+scenes too. Loader: `argus/data/nvidia_mtmc.py`. Sites are spatially contiguous groups
+of cameras, ordered by the mean floor position of the people each camera sees
+(`site_map_by_fov`).
+
+Everything runs **on Kaggle** (GPU + internet). The local machine only builds and pushes
+the kernel and pulls results back; no video or ground truth is downloaded locally.
+
+```bash
+python kaggle-run/build.py smoke            # modes: smoke | full | campus | e4
+kaggle kernels push -p kaggle-run/smoke
+kaggle kernels status ammarhussain16/argus-nvidia-mtmc-smoke
+PYTHONUTF8=1 kaggle kernels output ammarhussain16/argus-nvidia-mtmc-smoke     -p kaggle-run/output/smoke --file-pattern "(results/|\.log$)"   # results + log only
+```
+
+`build.py` embeds the current working tree (argus/, scripts/, tests/, configs/) in the
+kernel script, so no GitHub push is needed. On Kaggle, the kernel:
+1. installs the missing packages and fetches the OSNet-AIN MSMT17 weights;
+2. runs the test suite (and stops if it fails);
+3. runs `scripts/nvidia_pipeline.py`.
+
+The pipeline handles one scene at a time: download, GT tracklets, OSNet features from
+the videos on the GPU, delete the videos, then a temporal train/test split. Walking
+times, overlap groups, centering and tau are fitted on train. Then it runs:
+- **Per scene:** E1 + E5 on test, with the scene's cameras split into 2 sites (one building).
+- **Campus:** several 16-camera scenes are combined into one stream. Each scene is a
+  building, with disjoint cameras and people, all on one clock. Buildings are grouped into
+  1/2/4 sites. E4 runs strong scaling on it (multi-process, timed), plus E1 and E5 at the
+  largest site count.
+
+| Mode | What it runs | Kaggle time (measured) |
+|---|---|---|
+| `smoke` | E1/E5 on scene_061; campus of scene_061–062, 1–2 sites, 1 seed | 20 min |
+| `full` | E1/E5 on scene_061–070, then the campus (scene_071–078) | 1 h 25 min for the 10 scenes |
+| `campus` | campus only: scene_071–078 (128 cams), E1/E5 at 4 sites, E4 1/2/4 sites | 2 h 38 min |
+| `e4` | E4 only, CPU, on the features cached by `campus` (attached as kernel input) | 20 min |
+
+The results in the repository come from `full` (its 10 per-scene runs; its campus part
+stopped on a broken video in the release, see below), then `campus`, then `e4`. Features
+take about 8.5 min per 10-camera scene and 15 min per 16-camera scene on a Kaggle GPU kernel.
+
+**Broken video in the release:** `test/scene_071/camera_0649/video.mp4` is a 262 KB stub
+(no moov atom). The other cameras' videos are 115–304 MB. It is the only such file
+among the 30 test scenes. The pipeline now checks every video and drops cameras it cannot
+read (logged, and recorded as `dropped_cam_ids` in the profile).
+
+**BLAS threads in E4:** by default, every process (hub, sites, player) starts one
+math-library thread per core. On a 4-vCPU machine that oversubscribes the CPU: in the
+first E4 run, ours *fell* from 996 to 432 ev/s as sites were added
+(`results/real_nvidia_e4_blas_default.csv`). The real-data E4 config therefore sets
+`blas_threads: 1` (every child process, both methods). Synthetic configs do not set it,
+so their results reproduce unchanged.
+
+Outputs: `results/real_nvidia_{e1,e5,e4}.csv`, `results/real_nvidia_campus_{e1,e5}.csv`,
+`results/real_nvidia_profile.json` (per-scene data statistics, timings and topology:
+overlap groups, border cameras, walking times), `results/tables/real_nvidia_e1.md`
+and `results/tables/real_nvidia_campus.md`.
+
+### Results (Kaggle, 2026-11-07)
+
+**Per scene** (test scenes 061–070, 10 cameras and 20–25 people each, 800 s, 6,637 test
+tracklets in total, 2 sites per scene). Mean ± std over the 10 scenes:
+
+| Method | Pairwise F1 | IDF1 | Violations | Agreement w/ B1 |
+|---|---|---|---|---|
+| Ours | **0.738 ± 0.086** | 0.929 | 0 | 0.922 |
+| Ours two-level (option b) | 0.738 ± 0.085 | 0.928 | 0 | 0.925 (0.987 w/ centralized) |
+| Ours two-level (option a) | 0.718 ± 0.092 | 0.919 | 0 | 0.885 (0.917 w/ centralized) |
+| B1 offline | 0.729 ± 0.095 | 0.928 | 0 | 1.000 |
+| B3 no correction | 0.653 ± 0.114 | 0.872 | 0 | 0.777 |
+| B4 no constraints | 0.183 ± 0.170 | 0.309 | 20 in total | 0.188 |
+
+- Ours beats B3 in every scene. Against B1 it is above in 8 of 10 scenes, tied in 1 and below in 1 (scene_067: 0.808 vs 0.831).
+- Option b ≥ option a, as on synthetic data.
+- The hub sent 18–469 SplitRequests per scene, so the correction path is exercised.
+- Bytes inside one building: ours 26.4 MiB vs B5 26.1 MiB over the 10 scenes. People
+  visit 8–9 of the 10 cameras, so every camera is a border camera and the two-level
+  design saves nothing within a building.
+- The indoor cameras overlap heavily: 1–3 overlap groups per scene. Within a
+  building, the constraints mostly enforce "not in two places at once".
+
+**Campus** (scene_071–078: 8 buildings × 16 cameras = 128 cameras, 255 people,
+12,892 test tracklets, 4 sites):
+- Accuracy: ours F1 0.746 / IDF1 0.908, 0 violations; B1 0.739, B3 0.635, B4 0.091
+  with 16 violations.
+- Bytes: ours **0.78 MiB vs 50.8 MiB** for B5 (65×), with no staleness; B6 needs
+  15.5 MiB for 0.5 s staleness.
+- Caveat: nobody moves between the buildings (each scene is its own synthetic world).
+  So no camera is a border camera, the hub needs no vectors, two-level equals
+  centralized by construction, and there are 0 SplitRequests. The paper should present
+  this as *independent* buildings.
+
+**E4 on the campus** (4 vCPU, 1 BLAS thread per process, 3 seeds):
+
+| Sites | Ours max ev/s | B5 max ev/s | Ours e2e p99 | B5 e2e p99 |
+|---|---|---|---|---|
+| 1 | 932 | 1,016 | 4.1 ms | 8.7 s |
+| 2 | 2,211 | 1,447 | 4.5 ms | 8.6 s |
+| 4 | **3,531** (3.8×) | 1,866 | 29 ms | 11.0 s |
+
+At 20× real time (about 1,240 ev/s offered), neither method keeps up with 1 site. With
+2 and 4 sites, ours keeps up with p99 ≤ 6.1 ms, while B5 has p99 of 1.5–3.5 s. With 4
+sites, the machine runs 6 processes on 4 vCPUs, so the 4-site numbers are a lower bound.
+Full tables: `results/tables/real_nvidia_e1.md`, `results/tables/real_nvidia_campus.md`.
+
 ## Limitations to state in the paper
 
 - Python implementation on one machine. Sites and hub are separate processes over ZeroMQ, but there is no real network: we did not use `tc netem` delay or loss.
@@ -203,4 +313,11 @@ with global IDs, so check that against the release.
 - The hub processes metadata for every tracklet, so it saturates at about 4 sites (E4; hub CPU ≈ 1.0). Values slightly above 1.0 are BLAS threads.
 - Greedy online decisions (agreement with offline ≈ 0.99 normal, 0.98 hard).
 - Two-level vs centralized accuracy is a bytes trade-off (E9). At the cheapest radius, the hard setting loses 0.06 F1.
-- Real data: only WILDTRACK, which is small (2 × 100 s, 7 overlapping cameras) and appearance-only. MTMMC (multi-building, real walking times) is pending access. Synthetic workloads remain the main scaling evidence.
+- Real data:
+  - WILDTRACK is small (2 × 100 s, 7 overlapping cameras) and appearance-only.
+  - NVIDIA MTMC 2024 is rendered (synthetic people in indoor scenes), with heavily
+    overlapping cameras inside each building. Its "campus" combines independent scenes,
+    so it has no movement between buildings.
+  - MTMMC (a real multi-building campus with real walking times) is pending access.
+  - Real-data E4 ran on a 4-vCPU Kaggle machine; the 12-core synthetic E4 remains the
+    main scaling evidence.

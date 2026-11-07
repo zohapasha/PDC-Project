@@ -124,3 +124,45 @@ def choose_thresholds(stream_train: Stream, base_cfg: dict, grid=(0.5, 0.55, 0.6
         if best is None or f1 > best[1]:
             best = (tau, f1)
     return best
+
+
+def build_split_streams(tr: pd.DataFrame, vec: np.ndarray, prov, fps: float, n_cams: int,
+                        site_of_cam, out: str, train_frac: float = 0.5, center: bool = True,
+                        engine_cfg: dict | None = None, log=print) -> dict:
+    """Temporal train/test split -> <out>_train.parquet, <out>_test.parquet.
+
+    Walking times and overlap groups are estimated on the training split only, features
+    are centred with the training mean (OSNet outputs are non-negative after ReLU, which
+    inflates every cosine), and tau_accept is chosen on train by pairwise F1 when
+    engine_cfg is given. Returns paths, the chosen tau, and topology statistics."""
+    assert len(vec) == len(tr), "feature rows must align with the tracklet table"
+    vec = np.asarray(vec, np.float32)
+    prov = None if prov is None else np.asarray(prov, np.float32)
+    t_cut = tr.t_start.min() + train_frac * (tr.t_end.max() - tr.t_start.min())
+    tr_idx = np.nonzero(tr.t_end.to_numpy() <= t_cut)[0]
+    te_idx = np.nonzero(tr.t_start.to_numpy() > t_cut)[0]
+    topo = estimate_topology(tr.iloc[tr_idx], n_cams, site_of_cam)
+    if center:
+        mu = vec[tr_idx].mean(0)
+        unit = lambda x: (x / np.linalg.norm(x, axis=1, keepdims=True)).astype(np.float32)
+        vec = unit(vec - mu)
+        if prov is not None:
+            prov = unit(prov - mu)
+    res = {"n_overlap_groups": int(topo.group.max()) + 1, "n_sites": int(topo.n_sites),
+           "n_border_cams": int(topo.border.sum()),
+           "D_finite_median_s": float(np.median(topo.D[(topo.D > 0) & (topo.D < 1e4)]))
+           if ((topo.D > 0) & (topo.D < 1e4)).any() else 0.0}
+    for name, idx in (("train", tr_idx), ("test", te_idx)):
+        sub = tr.iloc[idx].reset_index(drop=True)
+        s = to_stream(sub, vec[idx], topo, fps, None if prov is None else prov[idx])
+        path = f"{out}_{name}.parquet"
+        s.save(path)
+        res[f"{name}_path"] = path
+        res[f"n_{name}_tracklets"] = int(len(sub))
+        res[f"n_{name}_people"] = int(sub.gt_pid.nunique())
+        log(f"{name}: {len(sub)} tracklets, {sub.gt_pid.nunique()} people -> {path}")
+        if name == "train" and engine_cfg is not None:
+            tau, f1 = choose_thresholds(s, engine_cfg)
+            res["tau_accept"], res["train_pw_f1"] = float(tau), float(f1)
+            log(f"chosen tau_accept on train = {tau} (pairwise F1 {f1:.3f}); freeze it for test")
+    return res

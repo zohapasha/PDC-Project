@@ -21,6 +21,9 @@ def sysinfo() -> dict:
             commit += "-dirty"
     except Exception:
         commit = "nogit"
+    import os
+    if commit == "nogit" and os.environ.get("ARGUS_GIT"):
+        commit = os.environ["ARGUS_GIT"]       # code bundle without .git (Kaggle run)
     cpu = platform.processor()
     try:
         if sys.platform == "win32":

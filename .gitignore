@@ -9,3 +9,9 @@ results/logs/
 *.npy
 *.mp4
 .venv-feat/
+kaggle-run/smoke/
+kaggle-run/full/
+kaggle-run/output/
+configs/generated/
+kaggle-run/campus/
+kaggle-run/e4/

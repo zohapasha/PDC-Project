@@ -236,9 +236,14 @@ def _guard(fn, q, *args):
 
 # ======================================================================== driver
 def run_mp(stream_path: str, topo, cfg: dict, mode: str = "two_level", speed=None,
-           base_port: int | None = None, timeout: float = 1200.0) -> dict:
+           base_port: int | None = None, timeout: float = 1200.0,
+           blas_threads: int | None = None) -> dict:
     """mode: 'two_level' (ours) or 'central' (B5). speed=None replays as fast as possible
-    (max throughput); speed=k replays k x real time (latency at a given load)."""
+    (max throughput); speed=k replays k x real time (latency at a given load).
+    blas_threads=k caps the BLAS/OpenMP threads of every child process (the children are
+    spawned, so they read the environment when they import numpy). On a machine with few
+    cores, uncapped BLAS pools of the hub, every site and the player oversubscribe the CPU.
+    None leaves the library defaults (as in the synthetic runs)."""
     ctxm = mp.get_context("spawn")
     base_port = base_port or (20000 + (os.getpid() * 7 + int(time.time())) % 20000)
     n = topo.n_sites
@@ -253,8 +258,21 @@ def run_mp(stream_path: str, topo, cfg: dict, mode: str = "two_level", speed=Non
                                                        base_port, readies[1 + sid], start, q)))
     procs.append(ctxm.Process(target=_guard, args=(_player_main, q, stream_path, tj, base_port,
                                                    speed, readies[-1], start, q)))
-    for p in procs:
-        p.start()
+    env_keys = ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
+                "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS")
+    saved = {k: os.environ.get(k) for k in env_keys}
+    if blas_threads:
+        for k in env_keys:
+            os.environ[k] = str(int(blas_threads))
+    try:
+        for p in procs:
+            p.start()
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
     for r in readies:
         if not r.wait(timeout=300):
             for p in procs:

@@ -171,22 +171,30 @@ def e3_corrections(p, seed):
 
 # ============================================================================ E4
 def e4_scaling(p, seed):
-    """Throughput and end-to-end latency vs #sites (multi-process). kind=weak|strong."""
+    """Throughput and end-to-end latency vs #sites (multi-process). kind=weak|strong.
+    Real data: `streams: {n_sites: path}` gives one prepared stream per site count (the
+    same scene split into that many sites); the generator is not used."""
     from ..sync.mp import run_mp
     kind = p.get("kind", "weak")
     rows = []
+    real = p.get("streams")                  # real data: {n_sites: prepared stream path}
     for n_sites in p.get("sites", [1, 2, 4, 8]):
-        if kind == "weak":
-            g = gen_cfg(p, seed)
-            g = replace(g, n_buildings=n_sites, n_sites=n_sites,
-                        n_people=p.get("people_per_site", 250) * n_sites)
+        if real:
+            path = real[n_sites] if n_sites in real else real[str(n_sites)]
+            s = _radius(Stream.load(path), p)
         else:
-            g = replace(gen_cfg(p, seed), n_sites=n_sites)
-        s = _load(g, p)
-        path = f"data/cache/synth_{g.key()}.parquet"
+            if kind == "weak":
+                g = gen_cfg(p, seed)
+                g = replace(g, n_buildings=n_sites, n_sites=n_sites,
+                            n_people=p.get("people_per_site", 250) * n_sites)
+            else:
+                g = replace(gen_cfg(p, seed), n_sites=n_sites)
+            s = _load(g, p)
+            path = f"data/cache/synth_{g.key()}.parquet"
         for method in p.get("methods", ["two_level", "central"]):
             for speed_name, speed in (("max", None), ("fixed", p.get("speed", 20.0))):
-                r = run_mp(path, s.topo, eng_cfg(p), mode=method, speed=speed)
+                r = run_mp(path, s.topo, eng_cfg(p), mode=method, speed=speed,
+                           blas_threads=p.get("blas_threads"))
                 lat = r["hub"]["e2e_lat_ns"] / 1e6
                 site_lat = np.concatenate([x["site_lat_ns"] for x in r["sites"]]) / 1e6
                 rows.append({
@@ -207,7 +215,7 @@ def e4_scaling(p, seed):
 
 # ============================================================================ E5
 def e5_bytes(p, seed):
-    s = _load(gen_cfg(p, seed), p)
+    s = get_stream(p, seed)
     cfg = eng_cfg(p)
     rows = []
     tl = run_two_level(s, cfg)
