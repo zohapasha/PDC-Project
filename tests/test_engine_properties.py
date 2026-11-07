@@ -4,108 +4,115 @@ import numpy as np
 from hypothesis import given, settings, strategies as st
 
 from argus.baselines.offline import full_recompute
-from argus.common.constraints import Checker
+from argus.common.constraints import ConstraintChecker
 from argus.common.topology import Topology, overlap_groups, shortest_paths
-from argus.common.types import INF
+from argus.common.types import DELTA_BELONGS_TO, INF
 from argus.core.engine import IdentityEngine
 
 
-def make_topo(n, edges, overlaps):
-    D, _ = shortest_paths(n, edges, overlaps)
-    D[np.isinf(D)] = 1e6
-    return Topology(n, D, overlap_groups(n, overlaps), np.zeros(n, int),
-                    np.zeros(n, bool), np.zeros(1, int), edges)
+def make_topology(n_cameras, corridors, overlap_pairs):
+    walk_time, _ = shortest_paths(n_cameras, corridors, overlap_pairs)
+    walk_time[np.isinf(walk_time)] = 1e6
+    return Topology(n_cameras, walk_time, overlap_groups(n_cameras, overlap_pairs),
+                    np.zeros(n_cameras, int), np.zeros(n_cameras, bool), np.zeros(1, int), corridors)
 
 
 @st.composite
 def scenario(draw):
-    n = draw(st.integers(1, 5))
-    edges = [(i, draw(st.integers(0, i - 1)), float(draw(st.integers(1, 20))))
-             for i in range(1, n)]
-    overlaps = [(a, b) for a, b, _ in edges if draw(st.integers(0, 3)) == 0]
-    topo = make_topo(n, edges, overlaps)
-    k = draw(st.integers(2, 14))
-    verts = []
-    for t in range(k):
-        s = float(draw(st.integers(0, 120)))
-        verts.append((t, draw(st.integers(0, n - 1)), s, s + float(draw(st.integers(1, 15)))))
-    ops = []
+    n_cameras = draw(st.integers(1, 5))
+    corridors = [(camera, draw(st.integers(0, camera - 1)), float(draw(st.integers(1, 20))))
+                 for camera in range(1, n_cameras)]
+    overlap_pairs = [(camera_a, camera_b) for camera_a, camera_b, _ in corridors
+                     if draw(st.integers(0, 3)) == 0]
+    topology = make_topology(n_cameras, corridors, overlap_pairs)
+    n_tracklets = draw(st.integers(2, 14))
+    tracklets = []
+    for tracklet_id in range(n_tracklets):
+        start = float(draw(st.integers(0, 120)))
+        tracklets.append((tracklet_id, draw(st.integers(0, n_cameras - 1)), start,
+                          start + float(draw(st.integers(1, 15)))))
+    operations = []
     for _ in range(draw(st.integers(1, 40))):
         kind = draw(st.sampled_from(["add", "add", "add", "update", "remove", "block", "inf"]))
-        a = draw(st.integers(0, k - 1))
-        b = draw(st.integers(0, k - 1))
-        w = draw(st.integers(40, 100)) / 100.0
-        ops.append((kind, a, b, w))
-    return topo, verts, ops
+        tracklet_a = draw(st.integers(0, n_tracklets - 1))
+        tracklet_b = draw(st.integers(0, n_tracklets - 1))
+        score = draw(st.integers(40, 100)) / 100.0
+        operations.append((kind, tracklet_a, tracklet_b, score))
+    return topology, tracklets, operations
 
 
-def _run(topo, verts, ops, mode):
-    eng = IdentityEngine(topo, tau_accept=0.7, tau_keep=0.5, mode=mode, emit=True,
-                         emit_belongs=True, check=True)
-    for t, c, s, e in verts:
-        eng.add_vertex(t, c, s, e)
-    for kind, a, b, w in ops:
+def _run(topology, tracklets, operations, mode):
+    engine = IdentityEngine(topology, tau_accept=0.7, tau_keep=0.5, mode=mode,
+                            emit_tree_deltas=True, emit_belongs_to=True, verify_invariants=True)
+    for tracklet_id, camera_id, start, end in tracklets:
+        engine.add_vertex(tracklet_id, camera_id, start, end)
+    for kind, tracklet_a, tracklet_b, score in operations:
         if kind == "add":
-            eng.add_match(a, b, w)
+            engine.add_match(tracklet_a, tracklet_b, score)
         elif kind == "update":
-            if a in eng.adj and b in eng.adj[a]:
-                eng.update_match(a, b, w)
+            if tracklet_a in engine.match_scores and tracklet_b in engine.match_scores[tracklet_a]:
+                engine.update_match(tracklet_a, tracklet_b, score)
         elif kind == "remove":
-            eng.remove_match(a, b)
+            engine.remove_match(tracklet_a, tracklet_b)
         elif kind == "block":
-            eng.remove_match(a, b, block=True)
+            engine.remove_match(tracklet_a, tracklet_b, block=True)
         elif kind == "inf" and mode == "full":
             # +inf links must never be rejected when the endpoints' union is feasible
             # (hub semantics); otherwise they are just stored.
-            pa, pb = eng.V[a].person, eng.V[b].person
-            fresh = (a, b) not in eng.blocked and (b, a) not in eng.blocked and b not in eng.adj[a]
-            feasible = fresh and (pa == pb or eng.chk.can_merge(eng.P[pa].visits, eng.P[pb].visits)[0])
-            eng.add_match(a, b, INF)
-            if feasible and a != b:
-                assert eng.V[a].person == eng.V[b].person
-    eng.check_invariants()
-    return eng
+            person_a = engine.vertices[tracklet_a].person_id
+            person_b = engine.vertices[tracklet_b].person_id
+            is_new = ((tracklet_a, tracklet_b) not in engine.blocked_pairs
+                      and (tracklet_b, tracklet_a) not in engine.blocked_pairs
+                      and tracklet_b not in engine.match_scores[tracklet_a])
+            feasible = is_new and (person_a == person_b or engine.checker.can_merge(
+                engine.persons[person_a].visits, engine.persons[person_b].visits)[0])
+            engine.add_match(tracklet_a, tracklet_b, INF)
+            if feasible and tracklet_a != tracklet_b:
+                assert engine.vertices[tracklet_a].person_id == engine.vertices[tracklet_b].person_id
+    engine.check_invariants()
+    return engine
 
 
 @settings(max_examples=1500, deadline=None)
 @given(scenario())
-def test_invariants_full(sc):
-    _run(*sc, "full")
+def test_invariants_full(generated):
+    _run(*generated, "full")
 
 
 @settings(max_examples=600, deadline=None)
 @given(scenario())
-def test_invariants_component(sc):
-    _run(*sc, "component")
+def test_invariants_component(generated):
+    _run(*generated, "component")
 
 
 @settings(max_examples=600, deadline=None)
 @given(scenario())
-def test_invariants_no_correction(sc):
-    _run(*sc, "no_correction")
+def test_invariants_no_correction(generated):
+    _run(*generated, "no_correction")
 
 
 @settings(max_examples=500, deadline=None)
 @given(scenario())
-def test_offline_reference_is_feasible(sc):
-    eng = _run(*sc, "full")
-    part, _ = full_recompute(eng)
-    chk = Checker(sc[0])
-    groups = {}
-    for t, lab in part.items():
-        v = eng.V[t]
-        groups.setdefault(lab, []).append((v.ts, v.te, v.cam, t))
-    for vs in groups.values():
-        assert chk.feasible_bruteforce(vs)
+def test_offline_reference_is_feasible(generated):
+    engine = _run(*generated, "full")
+    partition, _ = full_recompute(engine)
+    checker = ConstraintChecker(generated[0])
+    visits_of_label = {}
+    for tracklet_id, label in partition.items():
+        vertex = engine.vertices[tracklet_id]
+        visits_of_label.setdefault(label, []).append(
+            (vertex.start_time, vertex.end_time, vertex.camera_id, tracklet_id))
+    for visits in visits_of_label.values():
+        assert checker.feasible_bruteforce(visits)
 
 
 @settings(max_examples=500, deadline=None)
 @given(scenario())
-def test_belongs_deltas_replay_to_partition(sc):
+def test_belongs_deltas_replay_to_partition(generated):
     """Replaying emitted BelongsTo deltas reproduces the engine's partition."""
-    eng = _run(*sc, "full")
-    lab = {}
-    for d in eng.out:
-        if d[0] == "B":
-            lab[d[1]] = d[3]
-    assert lab == eng.partition()
+    engine = _run(*generated, "full")
+    person_of_tracklet = {}
+    for delta in engine.emitted_deltas:
+        if delta[0] == DELTA_BELONGS_TO:
+            person_of_tracklet[delta[1]] = delta[3]
+    assert person_of_tracklet == engine.partition()

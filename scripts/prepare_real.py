@@ -1,4 +1,4 @@
-"""Build ARGUS streams from a real dataset (after features were extracted on Colab).
+"""Build ARGUS streams from a real dataset (after features were extracted on a GPU).
 
 WILDTRACK:
   python scripts/prepare_real.py wildtrack --root /data/Wildtrack \
@@ -23,45 +23,45 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import numpy as np  # noqa: E402
 
-from argus.data import tracklets as T  # noqa: E402
-from argus.eval.experiments import DEFAULT_ENGINE  # noqa: E402
+from argus.data import mtmmc, tracklets  # noqa: E402
+from argus.eval.experiments import DEFAULT_ENGINE_CONFIG  # noqa: E402
 
 if __name__ == "__main__":
-    ap = argparse.ArgumentParser()
-    ap.add_argument("dataset", choices=["wildtrack", "mtmmc"])
-    ap.add_argument("--root", required=True)
-    ap.add_argument("--vec", required=True)
-    ap.add_argument("--prov", default=None)
-    ap.add_argument("--fps", type=float, default=None)
-    ap.add_argument("--sites", default=None)
-    ap.add_argument("--gap", type=float, default=1.0)
-    ap.add_argument("--p_frag", type=float, default=0.0)
-    ap.add_argument("--train_frac", type=float, default=0.5)
-    ap.add_argument("--no_center", action="store_true",
-                    help="skip mean-centering (OSNet features are non-negative after ReLU, "
-                         "which inflates every cosine; the mean is estimated on train only)")
-    ap.add_argument("--out", required=True)
-    a = ap.parse_args()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("dataset", choices=["wildtrack", "mtmmc"])
+    parser.add_argument("--root", required=True)
+    parser.add_argument("--vec", required=True, dest="vectors_path")
+    parser.add_argument("--prov", default=None, dest="provisional_vectors_path")
+    parser.add_argument("--fps", type=float, default=None)
+    parser.add_argument("--sites", default=None, help='camera groups per site, e.g. "0,1;2,3"')
+    parser.add_argument("--gap", type=float, default=1.0, dest="gap_s")
+    parser.add_argument("--p_frag", type=float, default=0.0)
+    parser.add_argument("--train_frac", type=float, default=0.5)
+    parser.add_argument("--no_center", action="store_true",
+                        help="skip mean-centering (OSNet features are non-negative after ReLU, "
+                             "which inflates every cosine; the mean is estimated on train only)")
+    parser.add_argument("--out", required=True, dest="output_prefix")
+    args = parser.parse_args()
 
-    if a.dataset == "wildtrack":
-        from argus.data import wildtrack as D
-        boxes = D.load_boxes(a.root)
-        fps = a.fps or D.ANN_FPS
+    if args.dataset == "wildtrack":
+        from argus.data import wildtrack
+        boxes = wildtrack.load_boxes(args.root)
+        fps = args.fps or wildtrack.ANNOTATION_FPS
     else:
-        from argus.data import mtmmc as D
-        boxes = D.load_boxes(a.root)
-        fps = a.fps or 23.0
-    tr = T.boxes_to_tracklets(boxes, fps=fps, gap_s=a.gap, p_frag=a.p_frag)
-    vec = np.load(a.vec).astype(np.float32)
-    prov = np.load(a.prov).astype(np.float32) if a.prov else None
-    n_cams = int(boxes.cam.max()) + 1
-    if a.sites:
-        groups = [[int(c) for c in g.split(",")] for g in a.sites.split(";")]
-        site = [0] * n_cams
-        for i, g in enumerate(groups):
-            for c in g:
-                site[c] = i
+        boxes = mtmmc.load_boxes(args.root)
+        fps = args.fps or 23.0
+    tracklet_table = tracklets.boxes_to_tracklets(boxes, fps=fps, gap_s=args.gap_s,
+                                                  p_frag=args.p_frag)
+    vectors = np.load(args.vectors_path).astype(np.float32)
+    provisional_vectors = (np.load(args.provisional_vectors_path).astype(np.float32)
+                           if args.provisional_vectors_path else None)
+    n_cameras = int(boxes.camera_id.max()) + 1
+    if args.sites:
+        camera_groups = [[int(camera) for camera in group.split(",")]
+                         for group in args.sites.split(";")]
+        site_of_camera = mtmmc.site_map_from_groups(camera_groups, n_cameras)
     else:
-        site = [0] * n_cams
-    T.build_split_streams(tr, vec, prov, fps, n_cams, site, a.out, train_frac=a.train_frac,
-                          center=not a.no_center, engine_cfg=DEFAULT_ENGINE)
+        site_of_camera = [0] * n_cameras
+    tracklets.build_split_streams(tracklet_table, vectors, provisional_vectors, fps, n_cameras,
+                                  site_of_camera, args.output_prefix, train_frac=args.train_frac,
+                                  center=not args.no_center, engine_config=DEFAULT_ENGINE_CONFIG)

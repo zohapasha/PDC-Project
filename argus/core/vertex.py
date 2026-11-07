@@ -12,36 +12,36 @@ from collections import deque
 
 
 class VertexScheduler:
-    __slots__ = ("q", "msgs", "touched", "handlers")
+    __slots__ = ("queue", "n_messages", "touched_vertices", "handlers")
 
     def __init__(self):
-        self.q = deque()
-        self.msgs = 0
-        self.touched = set()
+        self.queue = deque()
+        self.n_messages = 0
+        self.touched_vertices = set()
         self.handlers = {}
 
-    def register(self, kind: int, fn):
-        self.handlers[kind] = fn
+    def register(self, message_kind: int, handler):
+        self.handlers[message_kind] = handler
 
     def reset(self):
-        self.msgs = 0
-        self.touched = set()
+        self.n_messages = 0
+        self.touched_vertices = set()
 
-    def send(self, vid: int, kind: int, payload):
-        self.q.append((vid, kind, payload))
-        self.msgs += 1
+    def send(self, vertex_id: int, message_kind: int, payload):
+        self.queue.append((vertex_id, message_kind, payload))
+        self.n_messages += 1
 
     def run(self):
-        q, handlers, touched = self.q, self.handlers, self.touched
-        while q:
-            vid, kind, payload = q.popleft()
-            touched.add(vid)
-            handlers[kind](vid, payload)
+        queue, handlers, touched_vertices = self.queue, self.handlers, self.touched_vertices
+        while queue:
+            vertex_id, message_kind, payload = queue.popleft()
+            touched_vertices.add(vertex_id)
+            handlers[message_kind](vertex_id, payload)
 
-    def local(self, vid: int):
+    def record_local_work(self, vertex_id: int):
         """Account for local work at a vertex that needs no message (e.g. the root
         updating its person summary)."""
-        self.touched.add(vid)
+        self.touched_vertices.add(vertex_id)
 
 
 # message kinds

@@ -31,250 +31,289 @@ import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
 import yaml  # noqa: E402
 
-from argus.data import features as F  # noqa: E402
-from argus.data import nvidia_mtmc as N  # noqa: E402
-from argus.data import tracklets as T  # noqa: E402
-from argus.eval.experiments import DEFAULT_ENGINE  # noqa: E402
+from argus.data import features  # noqa: E402
+from argus.data import nvidia_mtmc  # noqa: E402
+from argus.data import tracklets  # noqa: E402
+from argus.eval.experiments import DEFAULT_ENGINE_CONFIG  # noqa: E402
 from argus.eval.harness import run as run_config  # noqa: E402
 
-
-def log(*a):
-    print(time.strftime("[%H:%M:%S]"), *a, flush=True)
+PERSON_ID_OFFSET_PER_SCENE = 10**6      # keeps GT person ids of different scenes disjoint
 
 
-def seeds(s):
-    out = []
-    for part in s.split(","):
-        a, _, b = part.partition("-")
-        out += list(range(int(a), int(b or a) + 1))
-    return out
+def log(*parts):
+    print(time.strftime("[%H:%M:%S]"), *parts, flush=True)
 
 
-def probe_fps(path):
+def parse_seeds(spec):
+    """'0-2,5' -> [0, 1, 2, 5]."""
+    seeds = []
+    for part in spec.split(","):
+        first, _, last = part.partition("-")
+        seeds += list(range(int(first), int(last or first) + 1))
+    return seeds
+
+
+def probe_video(path):
+    """(fps, frame count) as reported by the container; (0, 0) if unreadable."""
     import cv2
-    cap = cv2.VideoCapture(path)
-    fps, n = cap.get(cv2.CAP_PROP_FPS), cap.get(cv2.CAP_PROP_FRAME_COUNT)
-    cap.release()
-    return float(fps or 0.0), int(n or 0)
+    capture = cv2.VideoCapture(path)
+    fps, n_frames = capture.get(cv2.CAP_PROP_FPS), capture.get(cv2.CAP_PROP_FRAME_COUNT)
+    capture.release()
+    return float(fps or 0.0), int(n_frames or 0)
 
 
 _EXTRACTOR = []
 
 
-def get_extractor(a):
+def get_extractor(args):
     """Created on first use, so a run on cached features needs no GPU or weights."""
     if not _EXTRACTOR:
-        _EXTRACTOR.append(F.make_extractor(a.model, a.weights, a.device))
+        _EXTRACTOR.append(features.make_extractor(args.model, args.weights, args.device))
     return _EXTRACTOR[0]
 
 
-def scene_features(a, scene, profile):
-    """Steps 1-3. Returns (boxes, tracklets, fps, vec, prov); features are cached in
-    <art>/<scene>_{vec,prov}.npy so a re-run skips the video work."""
-    vec_p = os.path.join(a.art, f"{scene}_vec.npy")
-    prov_p = os.path.join(a.art, f"{scene}_prov.npy")
-    have = os.path.exists(vec_p) and os.path.exists(prov_p)
-    log(f"== {scene}: downloading {'ground truth' if have else 'ground truth + videos'}")
-    t0 = time.time()
-    sdir = N.download_scene(a.split, scene, a.work, videos=not have)
-    boxes, ids = N.load_boxes(sdir, frame_step=a.frame_step)
-    fps = N.FPS / a.frame_step
-    info = {"scene": scene, "split": a.split, "cam_ids": ids, "download_s": time.time() - t0}
-    if not have:
+def scene_features(args, scene, profile):
+    """Steps 1-3. Returns (boxes, tracklet_table, fps, vectors, provisional_vectors);
+    features are cached in <artifacts_dir>/<scene>_{vec,prov}.npy so a re-run skips the
+    video work."""
+    vectors_path = os.path.join(args.artifacts_dir, f"{scene}_vec.npy")
+    provisional_path = os.path.join(args.artifacts_dir, f"{scene}_prov.npy")
+    dropped_path = os.path.join(args.artifacts_dir, f"{scene}_dropped.npy")
+    has_cached_features = os.path.exists(vectors_path) and os.path.exists(provisional_path)
+    log(f"== {scene}: downloading "
+        f"{'ground truth' if has_cached_features else 'ground truth + videos'}")
+    start = time.time()
+    scene_dir = nvidia_mtmc.download_scene(args.split, scene, args.download_dir,
+                                           videos=not has_cached_features)
+    boxes, dataset_camera_ids = nvidia_mtmc.load_boxes(scene_dir, frame_step=args.frame_step)
+    fps = nvidia_mtmc.FPS / args.frame_step
+    # profile JSON keys are kept stable (results/real_nvidia_profile.json)
+    info = {"scene": scene, "split": args.split, "cam_ids": dataset_camera_ids,
+            "download_s": time.time() - start}
+    if not has_cached_features:
         # Some released videos are broken (e.g. test/scene_071/camera_0649 is a 262 KB stub
         # without a moov atom). Drop such cameras: their boxes and tracklets are removed,
         # the camera index stays (it simply has no tracklets).
-        bad = [k for k, c in enumerate(ids) if probe_fps(N.video_path(sdir, c))[1] <= 0]
-        if bad:
+        dropped_cameras = [camera_id for camera_id, dataset_id in enumerate(dataset_camera_ids)
+                           if probe_video(nvidia_mtmc.video_path(scene_dir, dataset_id))[1] <= 0]
+        if dropped_cameras:
             log(f"   WARNING: unreadable video, dropping camera(s) "
-                f"{[ids[k] for k in bad]} ({int(boxes.cam.isin(bad).sum())} GT boxes)")
-            boxes = boxes[~boxes.cam.isin(bad)].reset_index(drop=True)
-            info["dropped_cam_ids"] = [ids[k] for k in bad]
-        np.save(os.path.join(a.art, f"{scene}_dropped.npy"), np.array(bad, np.int64))
+                f"{[dataset_camera_ids[c] for c in dropped_cameras]} "
+                f"({int(boxes.camera_id.isin(dropped_cameras).sum())} GT boxes)")
+            boxes = boxes[~boxes.camera_id.isin(dropped_cameras)].reset_index(drop=True)
+            info["dropped_cam_ids"] = [dataset_camera_ids[c] for c in dropped_cameras]
+        np.save(dropped_path, np.array(dropped_cameras, np.int64))
     else:
-        dp = os.path.join(a.art, f"{scene}_dropped.npy")
-        bad = np.load(dp).tolist() if os.path.exists(dp) else []
-        if bad:
-            boxes = boxes[~boxes.cam.isin(bad)].reset_index(drop=True)
-    if not have:
-        good = [c for k, c in enumerate(ids) if k not in bad]
-        vfps, nfr = probe_fps(N.video_path(sdir, good[0]))
-        info.update(video_fps=vfps, video_frames=nfr)
-        if vfps and abs(vfps - N.FPS) > 0.5:
-            log(f"   WARNING: video reports {vfps:.2f} fps, loader assumes {N.FPS}")
-    info.update(N.profile(boxes, fps))
-    tr = T.boxes_to_tracklets(boxes, fps=fps, gap_s=a.gap)
-    info["n_tracklets"] = int(len(tr))
+        dropped_cameras = np.load(dropped_path).tolist() if os.path.exists(dropped_path) else []
+        if dropped_cameras:
+            boxes = boxes[~boxes.camera_id.isin(dropped_cameras)].reset_index(drop=True)
+    if not has_cached_features:
+        readable_camera_ids = [dataset_id for camera_id, dataset_id in enumerate(dataset_camera_ids)
+                               if camera_id not in dropped_cameras]
+        video_fps, video_frames = probe_video(nvidia_mtmc.video_path(scene_dir, readable_camera_ids[0]))
+        info.update(video_fps=video_fps, video_frames=video_frames)
+        if video_fps and abs(video_fps - nvidia_mtmc.FPS) > 0.5:
+            log(f"   WARNING: video reports {video_fps:.2f} fps, loader assumes {nvidia_mtmc.FPS}")
+    info.update(nvidia_mtmc.summarize_boxes(boxes, fps))
+    tracklet_table = tracklets.boxes_to_tracklets(boxes, fps=fps, gap_s=args.gap_s)
+    info["n_tracklets"] = int(len(tracklet_table))
     log(f"   {info['n_boxes']} boxes, {info['n_cams']} cams, {info['n_people']} people, "
-        f"{info['duration_s']:.0f} s, {len(tr)} tracklets, "
+        f"{info['duration_s']:.0f} s, {len(tracklet_table)} tracklets, "
         f"{info['cams_per_person_mean']:.1f} cams/person")
-    if have:
-        vec, prov = np.load(vec_p), np.load(prov_p)
+    if has_cached_features:
+        vectors, provisional_vectors = np.load(vectors_path), np.load(provisional_path)
     else:
-        t1 = time.time()
-        paths = [N.video_path(sdir, c) for c in ids]
-        vec, prov = F.embed_tracklets_video(tr, boxes, paths, K=a.K, extractor=get_extractor(a),
-                                            workers=a.workers, log=log)
-        info["features_s"] = time.time() - t1
-        np.save(vec_p, vec)
-        np.save(prov_p, prov)
+        features_start = time.time()
+        video_paths = [nvidia_mtmc.video_path(scene_dir, dataset_id) for dataset_id in dataset_camera_ids]
+        vectors, provisional_vectors = features.embed_tracklets_video(
+            tracklet_table, boxes, video_paths, frames_per_tracklet=args.frames_per_tracklet,
+            extractor=get_extractor(args), workers=args.workers, log=log)
+        info["features_s"] = time.time() - features_start
+        np.save(vectors_path, vectors)
+        np.save(provisional_path, provisional_vectors)
         log(f"   features in {info['features_s']:.0f} s")
-    if not a.keep_videos:
-        shutil.rmtree(sdir, ignore_errors=True)
+    if not args.keep_videos:
+        shutil.rmtree(scene_dir, ignore_errors=True)
     profile.setdefault(scene, {}).update(info)
-    return boxes, tr, fps, vec, prov
+    return boxes, tracklet_table, fps, vectors, provisional_vectors
 
 
-def write_cfg(name, body):
+def write_config(name, body):
     path = os.path.join("configs", "generated", f"{name}.yaml")
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w") as f:
-        yaml.safe_dump(body, f, sort_keys=False)
+    with open(path, "w") as file:
+        yaml.safe_dump(body, file, sort_keys=False)
     return path
 
 
-def concat(pattern, out):
-    files = sorted(glob.glob(pattern))
-    if not files:
+def concat_csvs(pattern, output_path):
+    paths = sorted(glob.glob(pattern))
+    if not paths:
         return None
-    df = pd.concat([pd.read_csv(f) for f in files], ignore_index=True)
-    df.to_csv(out, index=False)
-    return df
+    combined = pd.concat([pd.read_csv(path) for path in paths], ignore_index=True)
+    combined.to_csv(output_path, index=False)
+    return combined
 
 
-def e1_table(df, path):
-    cols = ["pw_p", "pw_r", "pw_f1", "b3_f1", "idf1", "violations", "agree_offline",
-            "agree_centralized"]
-    cols = [c for c in cols if c in df.columns]
-    order = ["ours", "ours_two_level", "ours_two_level_a", "B1_offline", "B3_no_correction",
-             "B4_no_constraints"]
-    g = df.groupby("method")[cols].mean().reindex([m for m in order if m in set(df.method)])
-    lines = [f"Mean over {df.scene.nunique()} scenes ({', '.join(sorted(df.scene.unique()))}); "
-             f"{int(df.groupby('scene').n_tracklets.first().sum())} test tracklets in total.", "",
-             "| Method | " + " | ".join(cols) + " |", "|---" * (len(cols) + 1) + "|"]
-    for m, r in g.iterrows():
-        lines.append(f"| {m} | " + " | ".join(f"{v:.3f}" if c != "violations" else f"{v:.1f}"
-                                            for c, v in r.items()) + " |")
+def write_e1_table(results, path):
+    columns = ["pw_p", "pw_r", "pw_f1", "b3_f1", "idf1", "violations", "agree_offline",
+               "agree_centralized"]
+    columns = [column for column in columns if column in results.columns]
+    method_order = ["ours", "ours_two_level", "ours_two_level_a", "B1_offline",
+                    "B3_no_correction", "B4_no_constraints"]
+    means = results.groupby("method")[columns].mean().reindex(
+        [method for method in method_order if method in set(results.method)])
+    n_test_tracklets = int(results.groupby("scene").n_tracklets.first().sum())
+    lines = [f"Mean over {results.scene.nunique()} scenes "
+             f"({', '.join(sorted(results.scene.unique()))}); "
+             f"{n_test_tracklets} test tracklets in total.", "",
+             "| Method | " + " | ".join(columns) + " |", "|---" * (len(columns) + 1) + "|"]
+    for method, row in means.iterrows():
+        lines.append(f"| {method} | " + " | ".join(
+            f"{value:.3f}" if column != "violations" else f"{value:.1f}"
+            for column, value in row.items()) + " |")
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w") as f:
-        f.write("\n".join(lines) + "\n")
+    with open(path, "w") as file:
+        file.write("\n".join(lines) + "\n")
     print("\n".join(lines), flush=True)
 
 
-if __name__ == "__main__":
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--split", default="test", choices=["train", "val", "test"])
-    ap.add_argument("--e1_scenes", default="scene_061,scene_062,scene_063,scene_064")
-    ap.add_argument("--e1_sites", type=int, default=2)
-    ap.add_argument("--e4_scenes", default="scene_071,scene_072,scene_073,scene_074",
-                    help="scenes forming the E4 campus (one building each); '' to skip E4")
-    ap.add_argument("--e4_sites", default="1,2,4")
-    ap.add_argument("--e4_seeds", default="0-2")
-    ap.add_argument("--e4_speed", type=float, default=20.0)
-    ap.add_argument("--blas_threads", type=int, default=1,
-                    help="BLAS threads per E4 process (0 = library default)")
-    ap.add_argument("--e4_only", action="store_true",
-                    help="skip the campus E1/E5 (e.g. when re-running E4 on cached features)")
-    ap.add_argument("--work", default="/tmp/nvidia_mtmc", help="download dir (scratch)")
-    ap.add_argument("--art", default="data/real/nvidia", help="features + streams")
-    ap.add_argument("--weights", default="data/models/osnet_ain_x1_0_msmt17_combineall.pth")
-    ap.add_argument("--model", default="osnet_ain_x1_0")
-    ap.add_argument("--device", default="cuda")
-    ap.add_argument("--K", type=int, default=8)
-    ap.add_argument("--gap", type=float, default=1.0)
-    ap.add_argument("--frame_step", type=int, default=1)
-    ap.add_argument("--workers", type=int, default=4, help="parallel video decoders")
-    ap.add_argument("--keep_videos", action="store_true")
-    a = ap.parse_args()
+def frozen_engine_config(split_summary):
+    """Engine thresholds chosen on the training split."""
+    tau_accept = split_summary["tau_accept"]
+    return {"tau_accept": tau_accept, "tau_keep": min(0.5, tau_accept)}
 
-    os.makedirs(a.art, exist_ok=True)
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--split", default="test", choices=["train", "val", "test"])
+    parser.add_argument("--e1_scenes", default="scene_061,scene_062,scene_063,scene_064")
+    parser.add_argument("--e1_sites", type=int, default=2)
+    parser.add_argument("--e4_scenes", default="scene_071,scene_072,scene_073,scene_074",
+                        help="scenes forming the E4 campus (one building each); '' to skip E4")
+    parser.add_argument("--e4_sites", default="1,2,4")
+    parser.add_argument("--e4_seeds", default="0-2")
+    parser.add_argument("--e4_speed", type=float, default=20.0)
+    parser.add_argument("--blas_threads", type=int, default=1,
+                        help="BLAS threads per E4 process (0 = library default)")
+    parser.add_argument("--e4_only", action="store_true",
+                        help="skip the campus E1/E5 (e.g. when re-running E4 on cached features)")
+    parser.add_argument("--work", default="/tmp/nvidia_mtmc", dest="download_dir",
+                        help="download dir (scratch)")
+    parser.add_argument("--art", default="data/real/nvidia", dest="artifacts_dir",
+                        help="features + streams")
+    parser.add_argument("--weights", default="data/models/osnet_ain_x1_0_msmt17_combineall.pth")
+    parser.add_argument("--model", default="osnet_ain_x1_0")
+    parser.add_argument("--device", default="cuda")
+    parser.add_argument("--K", type=int, default=8, dest="frames_per_tracklet",
+                        help="frames sampled per tracklet")
+    parser.add_argument("--gap", type=float, default=1.0, dest="gap_s")
+    parser.add_argument("--frame_step", type=int, default=1)
+    parser.add_argument("--workers", type=int, default=4, help="parallel video decoders")
+    parser.add_argument("--keep_videos", action="store_true")
+    args = parser.parse_args()
+
+    os.makedirs(args.artifacts_dir, exist_ok=True)
     os.makedirs("results/tables", exist_ok=True)
-    prof_path = "results/real_nvidia_profile.json"
-    profile = json.load(open(prof_path)) if os.path.exists(prof_path) else {}
+    profile_path = "results/real_nvidia_profile.json"
+    profile = json.load(open(profile_path)) if os.path.exists(profile_path) else {}
 
     def save_profile():
-        with open(prof_path, "w") as f:
-            json.dump(profile, f, indent=1)
+        with open(profile_path, "w") as file:
+            json.dump(profile, file, indent=1)
 
     # ------------------------------------------------------------- E1 + E5 per scene
-    for scene in [s for s in a.e1_scenes.split(",") if s]:
-        boxes, tr, fps, vec, prov = scene_features(a, scene, profile)
-        n_cams = int(boxes.cam.max()) + 1
-        site = N.site_map_by_fov(boxes, n_cams, a.e1_sites)
-        res = T.build_split_streams(tr, vec, prov, fps, n_cams, site,
-                                    os.path.join(a.art, f"{scene}_s{a.e1_sites}"),
-                                    engine_cfg=DEFAULT_ENGINE, log=log)
-        profile[scene]["e1_split"] = {**res, "site_of_cam": site}
-        log(f"   topology: {res['n_overlap_groups']} overlap groups over {n_cams} cams, "
-            f"{res['n_border_cams']} border cams, median walking time {res['D_finite_median_s']:.1f} s")
+    for scene in [name for name in args.e1_scenes.split(",") if name]:
+        boxes, tracklet_table, fps, vectors, provisional_vectors = scene_features(args, scene, profile)
+        n_cameras = int(boxes.camera_id.max()) + 1
+        site_of_camera = nvidia_mtmc.site_map_by_fov(boxes, n_cameras, args.e1_sites)
+        split_summary = tracklets.build_split_streams(
+            tracklet_table, vectors, provisional_vectors, fps, n_cameras, site_of_camera,
+            os.path.join(args.artifacts_dir, f"{scene}_s{args.e1_sites}"),
+            engine_config=DEFAULT_ENGINE_CONFIG, log=log)
+        profile[scene]["e1_split"] = {**split_summary, "site_of_cam": site_of_camera}
+        log(f"   topology: {split_summary['n_overlap_groups']} overlap groups over {n_cameras} cams, "
+            f"{split_summary['n_border_cams']} border cams, "
+            f"median walking time {split_summary['D_finite_median_s']:.1f} s")
         save_profile()
-        eng = {"tau_accept": res["tau_accept"], "tau_keep": min(0.5, res["tau_accept"])}
-        for exp in ("e1", "e5"):
-            name = f"real_nvidia_{exp}_{scene}"
-            run_config(write_cfg(name, {"experiment": exp, "stream": res["test_path"],
-                                        "engine": eng, "name": name}), [0])
-            df = pd.read_csv(f"results/{name}.csv")
-            df["scene"] = scene
-            df.to_csv(f"results/{name}.csv", index=False)
+        engine_overrides = frozen_engine_config(split_summary)
+        for experiment_id in ("e1", "e5"):
+            name = f"real_nvidia_{experiment_id}_{scene}"
+            run_config(write_config(name, {"experiment": experiment_id,
+                                           "stream": split_summary["test_path"],
+                                           "engine": engine_overrides, "name": name}), [0])
+            scene_results = pd.read_csv(f"results/{name}.csv")
+            scene_results["scene"] = scene
+            scene_results.to_csv(f"results/{name}.csv", index=False)
         log(f"   {scene} done")
 
     # ------------------------------------------------------------- E4 campus of scenes
     # Each scene is one building (disjoint cameras and people, all on the same clock);
     # for n sites, buildings are assigned to sites in contiguous blocks. Strong scaling:
     # the campus is fixed, only the number of sites changes.
-    e4_scenes = [x for x in a.e4_scenes.split(",") if x]
+    e4_scenes = [name for name in args.e4_scenes.split(",") if name]
     if e4_scenes:
-        parts, cam_off, n_b = [], 0, len(e4_scenes)
-        building = []
-        for k, scene in enumerate(e4_scenes):
-            boxes, tr, fps, vec, prov = scene_features(a, scene, profile)
-            n_cams_k = max(len(profile[scene]["cam_ids"]), int(boxes.cam.max()) + 1)
-            t = tr[["cam", "gt_pid", "f_start", "f_end", "t_start", "t_end"]].copy()
-            t["cam"] += cam_off
-            t["gt_pid"] += k * 10**6
-            parts.append((t, vec, prov))
-            building += [k] * n_cams_k
-            cam_off += n_cams_k
+        scene_parts, camera_offset, n_buildings = [], 0, len(e4_scenes)
+        building_of_camera = []
+        for building, scene in enumerate(e4_scenes):
+            boxes, tracklet_table, fps, vectors, provisional_vectors = scene_features(args, scene, profile)
+            n_scene_cameras = max(len(profile[scene]["cam_ids"]), int(boxes.camera_id.max()) + 1)
+            scene_table = tracklet_table[["camera_id", "gt_person_id", "start_frame", "end_frame",
+                                          "start_time", "end_time"]].copy()
+            scene_table["camera_id"] += camera_offset
+            scene_table["gt_person_id"] += building * PERSON_ID_OFFSET_PER_SCENE
+            scene_parts.append((scene_table, vectors, provisional_vectors))
+            building_of_camera += [building] * n_scene_cameras
+            camera_offset += n_scene_cameras
             del boxes
             save_profile()
-        tr = pd.concat([t for t, _, _ in parts], ignore_index=True)
-        vec = np.concatenate([v for _, v, _ in parts])
-        prov = np.concatenate([q for _, _, q in parts])
-        o = np.lexsort((tr.cam.to_numpy(), tr.t_start.to_numpy(), tr.t_end.to_numpy()))
-        tr, vec, prov = tr.iloc[o].reset_index(drop=True), vec[o], prov[o]
-        log(f"== campus: {n_b} buildings, {cam_off} cams, {len(tr)} tracklets, "
-            f"{tr.gt_pid.nunique()} people")
-        streams, eng, campus = {}, None, {"scenes": e4_scenes, "n_cams": cam_off}
-        for n in [int(x) for x in a.e4_sites.split(",")]:
-            site = [building[c] * n // n_b for c in range(cam_off)]
-            res = T.build_split_streams(tr, vec, prov, fps, cam_off, site,
-                                        os.path.join(a.art, f"campus{n_b}_s{n}"),
-                                        engine_cfg=DEFAULT_ENGINE if eng is None else None, log=log)
-            if eng is None:
-                eng = {"tau_accept": res["tau_accept"], "tau_keep": min(0.5, res["tau_accept"])}
-            streams[n] = res["test_path"]
-            campus[f"s{n}"] = res
+        tracklet_table = pd.concat([table for table, _, _ in scene_parts], ignore_index=True)
+        vectors = np.concatenate([part_vectors for _, part_vectors, _ in scene_parts])
+        provisional_vectors = np.concatenate([part_provisional for _, _, part_provisional in scene_parts])
+        order = np.lexsort((tracklet_table.camera_id.to_numpy(), tracklet_table.start_time.to_numpy(),
+                            tracklet_table.end_time.to_numpy()))
+        tracklet_table = tracklet_table.iloc[order].reset_index(drop=True)
+        vectors, provisional_vectors = vectors[order], provisional_vectors[order]
+        log(f"== campus: {n_buildings} buildings, {camera_offset} cams, {len(tracklet_table)} tracklets, "
+            f"{tracklet_table.gt_person_id.nunique()} people")
+        test_stream_of_site_count, engine_overrides = {}, None
+        campus = {"scenes": e4_scenes, "n_cams": camera_offset}
+        for n_sites in [int(count) for count in args.e4_sites.split(",")]:
+            site_of_camera = [building_of_camera[camera] * n_sites // n_buildings
+                              for camera in range(camera_offset)]
+            split_summary = tracklets.build_split_streams(
+                tracklet_table, vectors, provisional_vectors, fps, camera_offset, site_of_camera,
+                os.path.join(args.artifacts_dir, f"campus{n_buildings}_s{n_sites}"),
+                engine_config=DEFAULT_ENGINE_CONFIG if engine_overrides is None else None, log=log)
+            if engine_overrides is None:
+                engine_overrides = frozen_engine_config(split_summary)
+            test_stream_of_site_count[n_sites] = split_summary["test_path"]
+            campus[f"s{n_sites}"] = split_summary
         profile["campus"] = campus
         save_profile()
-        n_max = max(streams)
-        log(f"   E4 on the campus: sites {list(streams)}, {os.cpu_count()} CPUs visible")
-        for exp in ([] if a.e4_only else ["e1", "e5"]):   # campus accuracy + bytes at max sites
-            name = f"real_nvidia_campus_{exp}"
-            run_config(write_cfg(name, {"experiment": exp, "stream": streams[n_max],
-                                        "engine": eng, "name": name}), [0])
+        max_sites = max(test_stream_of_site_count)
+        log(f"   E4 on the campus: sites {list(test_stream_of_site_count)}, "
+            f"{os.cpu_count()} CPUs visible")
+        for experiment_id in ([] if args.e4_only else ["e1", "e5"]):   # campus accuracy + bytes at max sites
+            name = f"real_nvidia_campus_{experiment_id}"
+            run_config(write_config(name, {"experiment": experiment_id,
+                                           "stream": test_stream_of_site_count[max_sites],
+                                           "engine": engine_overrides, "name": name}), [0])
         name = "real_nvidia_e4"
         if os.path.exists(f"results/{name}.csv"):
             os.remove(f"results/{name}.csv")
-        run_config(write_cfg(name, {"experiment": "e4", "kind": "real_strong",
-                                    "sites": list(streams), "streams": streams,
-                                    "speed": a.e4_speed, "methods": ["two_level", "central"],
-                                    "blas_threads": a.blas_threads or None,
-                                    "engine": eng, "name": name}), seeds(a.e4_seeds))
+        run_config(write_config(name, {"experiment": "e4", "kind": "real_strong",
+                                       "sites": list(test_stream_of_site_count),
+                                       "streams": test_stream_of_site_count,
+                                       "speed": args.e4_speed, "methods": ["two_level", "central"],
+                                       "blas_threads": args.blas_threads or None,
+                                       "engine": engine_overrides, "name": name}),
+                   parse_seeds(args.e4_seeds))
 
     # ------------------------------------------------------------- collect
     save_profile()
-    e1 = concat("results/real_nvidia_e1_scene_*.csv", "results/real_nvidia_e1.csv")
-    concat("results/real_nvidia_e5_scene_*.csv", "results/real_nvidia_e5.csv")
-    if e1 is not None:
-        e1_table(e1, "results/tables/real_nvidia_e1.md")
+    e1_results = concat_csvs("results/real_nvidia_e1_scene_*.csv", "results/real_nvidia_e1.csv")
+    concat_csvs("results/real_nvidia_e5_scene_*.csv", "results/real_nvidia_e5.csv")
+    if e1_results is not None:
+        write_e1_table(e1_results, "results/tables/real_nvidia_e1.md")
     log("pipeline finished")

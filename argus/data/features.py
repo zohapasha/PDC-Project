@@ -1,4 +1,4 @@
-"""Appearance features for real tracklets (run on Colab GPU).
+"""Appearance features for real tracklets (run on a GPU, e.g. Kaggle).
 
 For each tracklet: sample K evenly spaced frames, crop the box (5% padding), embed with
 OSNet (torchreid, MSMT17/Market weights), average, L2-normalise -> float32 vector.
@@ -11,18 +11,32 @@ create realistic score revisions (evidence-driven deletions).
 Usage (WILDTRACK):
     from argus.data import wildtrack, tracklets, features
     boxes = wildtrack.load_boxes(ROOT)
-    tr = tracklets.boxes_to_tracklets(boxes, fps=wildtrack.ANN_FPS, gap_s=1.0)
-    vec, prov = features.embed_tracklets(tr, boxes,
-                    frame_loader=lambda cam, f: cv2.imread(wildtrack.image_path(ROOT, cam, f)))
-    np.save("wildtrack_vec.npy", vec); np.save("wildtrack_prov.npy", prov)
-For videos (one file per camera), use embed_tracklets_video(tr, boxes, video_paths).
+    tracklet_table = tracklets.boxes_to_tracklets(boxes, fps=wildtrack.ANNOTATION_FPS, gap_s=1.0)
+    vectors, provisional = features.embed_tracklets(
+        tracklet_table, boxes,
+        frame_loader=lambda camera_id, frame: cv2.imread(wildtrack.image_path(ROOT, camera_id, frame)))
+    np.save("wildtrack_vec.npy", vectors); np.save("wildtrack_prov.npy", provisional)
+For videos (one file per camera), use embed_tracklets_video(tracklet_table, boxes, video_paths).
 """
 from __future__ import annotations
 
+from typing import NamedTuple
+
 import numpy as np
 
+FEATURE_DIM = 512
 
-def make_extractor(model_name: str = "osnet_ain_x1_0", weights: str | None = None, device: str = "cuda"):
+
+class _CropJob(NamedTuple):
+    tracklet_index: int
+    in_first_half: bool       # frame belongs to the first half (provisional vector)
+    camera_id: int
+    frame: int
+    box: tuple                # (x1, y1, x2, y2)
+
+
+def make_extractor(model_name: str = "osnet_ain_x1_0", weights: str | None = None,
+                   device: str = "cuda"):
     try:
         from torchreid.utils import FeatureExtractor          # GitHub deep-person-reid
     except ImportError:
@@ -30,151 +44,161 @@ def make_extractor(model_name: str = "osnet_ain_x1_0", weights: str | None = Non
     return FeatureExtractor(model_name=model_name, model_path=weights or "", device=device)
 
 
-def _crop(img, x1, y1, x2, y2, pad=0.05):
-    h, w = img.shape[:2]
-    bw, bh = x2 - x1, y2 - y1
-    x1 = int(max(0, x1 - pad * bw)); x2 = int(min(w, x2 + pad * bw))
-    y1 = int(max(0, y1 - pad * bh)); y2 = int(min(h, y2 + pad * bh))
-    return img[y1:y2, x1:x2, ::-1]          # BGR -> RGB
+def _crop(image, x1, y1, x2, y2, pad=0.05):
+    image_height, image_width = image.shape[:2]
+    box_width, box_height = x2 - x1, y2 - y1
+    x1 = int(max(0, x1 - pad * box_width))
+    x2 = int(min(image_width, x2 + pad * box_width))
+    y1 = int(max(0, y1 - pad * box_height))
+    y2 = int(min(image_height, y2 + pad * box_height))
+    return image[y1:y2, x1:x2, ::-1]          # BGR -> RGB
 
 
-def _make_jobs(tr, boxes, K):
-    """(tracklet idx, first-half flag, cam, frame, box) for K evenly spaced frames per
-    tracklet, sorted by (cam, frame) so every camera is read front to back once."""
+def _make_crop_jobs(tracklet_table, boxes, frames_per_tracklet):
+    """One job per sampled frame: frames_per_tracklet evenly spaced frames per tracklet,
+    sorted by (camera, frame) so every camera is read front to back once."""
     jobs = []
-    x1, y1, x2, y2 = (boxes[c].to_numpy() for c in ("x1", "y1", "x2", "y2"))
-    cam, frame = boxes["cam"].to_numpy(), boxes["frame"].to_numpy()
-    pos = {ix: n for n, ix in enumerate(boxes.index)}
-    for i, rows in enumerate(tr["rows"]):
-        idx = np.linspace(0, len(rows) - 1, min(K, len(rows))).round().astype(int)
-        for j, k in enumerate(idx):
-            b = pos[rows[k]]
-            jobs.append((i, j < max(1, len(idx) // 2), int(cam[b]), int(frame[b]),
-                         (x1[b], y1[b], x2[b], y2[b])))
-    jobs.sort(key=lambda x: (x[2], x[3]))
+    x1, y1, x2, y2 = (boxes[column].to_numpy() for column in ("x1", "y1", "x2", "y2"))
+    camera_ids, frames = boxes["camera_id"].to_numpy(), boxes["frame"].to_numpy()
+    position_of_row = {row_label: position for position, row_label in enumerate(boxes.index)}
+    for tracklet_index, box_rows in enumerate(tracklet_table["box_rows"]):
+        sampled = np.linspace(0, len(box_rows) - 1,
+                              min(frames_per_tracklet, len(box_rows))).round().astype(int)
+        for sample_number, row_offset in enumerate(sampled):
+            position = position_of_row[box_rows[row_offset]]
+            jobs.append(_CropJob(tracklet_index, sample_number < max(1, len(sampled) // 2),
+                                 int(camera_ids[position]), int(frames[position]),
+                                 (x1[position], y1[position], x2[position], y2[position])))
+    jobs.sort(key=lambda job: (job.camera_id, job.frame))
     return jobs
 
 
-def _aggregate(jobs, feats, n_tr):
-    final = np.zeros((n_tr, feats.shape[1]), np.float32)
-    prov = np.zeros_like(final)
-    for (i, first_half, *_), f in zip(jobs, feats):
-        final[i] += f
-        if first_half:
-            prov[i] += f
-    unit = lambda x: x / np.maximum(np.linalg.norm(x, axis=1, keepdims=True), 1e-12)
-    return unit(final), unit(prov)
+def _aggregate(jobs, job_features, n_tracklets):
+    final_vectors = np.zeros((n_tracklets, job_features.shape[1]), np.float32)
+    provisional_vectors = np.zeros_like(final_vectors)
+    for job, feature in zip(jobs, job_features):
+        final_vectors[job.tracklet_index] += feature
+        if job.in_first_half:
+            provisional_vectors[job.tracklet_index] += feature
+
+    def normalize(vectors):
+        return vectors / np.maximum(np.linalg.norm(vectors, axis=1, keepdims=True), 1e-12)
+
+    return normalize(final_vectors), normalize(provisional_vectors)
 
 
-def embed_tracklets(tr, boxes, frame_loader, K: int = 8, extractor=None, batch: int = 128):
+def embed_tracklets(tracklet_table, boxes, frame_loader, frames_per_tracklet: int = 8,
+                    extractor=None, batch_size: int = 128):
     """Returns (final_vectors, provisional_vectors), both (n_tracklets, 512) float32.
-    tr must have a default RangeIndex (as boxes_to_tracklets returns)."""
+    tracklet_table must have a default RangeIndex (as boxes_to_tracklets returns)."""
     extractor = extractor or make_extractor()
-    jobs = _make_jobs(tr, boxes, K)
-    feats = np.zeros((len(jobs), 512), np.float32)
-    crops, pos, cache = [], [], {}
-    for n, (_, _, cam, frame, bb) in enumerate(jobs):
-        key = (cam, frame)
-        if key not in cache:
-            cache.clear()
-            cache[key] = frame_loader(cam, frame)
-        crops.append(_crop(cache[key], *bb))
-        pos.append(n)
-        if len(crops) == batch or n == len(jobs) - 1:
-            f = extractor(crops).cpu().numpy()
-            feats[pos] = f[:, :512]
-            crops, pos = [], []
-    return _aggregate(jobs, feats, len(tr))
+    jobs = _make_crop_jobs(tracklet_table, boxes, frames_per_tracklet)
+    job_features = np.zeros((len(jobs), FEATURE_DIM), np.float32)
+    crops, crop_job_indices, frame_cache = [], [], {}
+    for job_index, job in enumerate(jobs):
+        key = (job.camera_id, job.frame)
+        if key not in frame_cache:
+            frame_cache.clear()
+            frame_cache[key] = frame_loader(job.camera_id, job.frame)
+        crops.append(_crop(frame_cache[key], *job.box))
+        crop_job_indices.append(job_index)
+        if len(crops) == batch_size or job_index == len(jobs) - 1:
+            batch_features = extractor(crops).cpu().numpy()
+            job_features[crop_job_indices] = batch_features[:, :FEATURE_DIM]
+            crops, crop_job_indices = [], []
+    return _aggregate(jobs, job_features, len(tracklet_table))
 
 
-def _read_camera_crops(path, cam_jobs, seek_gap=300, size=(128, 256)):
+def _read_camera_crops(video_path, camera_jobs, seek_gap=300, size=(128, 256)):
     """Decode one video front to back and return [(job index, RGB crop)] for its jobs.
     Frames are grabbed sequentially (seeking only across long gaps), crops are resized
     to the re-ID input size right away to bound memory."""
     import cv2
-    cap = cv2.VideoCapture(path)
-    if not cap.isOpened():
-        raise FileNotFoundError(path)
-    n_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 1 << 30
-    out, pos, img = [], -1, None              # pos = index of the frame held in img
-    for n, (_, _, _, frame, bb) in cam_jobs:
-        f = min(max(frame, 0), n_frames - 1)
-        if f != pos:
-            if f < pos or f - pos > seek_gap:
-                cap.set(cv2.CAP_PROP_POS_FRAMES, f)
-                pos = f - 1
-            while pos < f:
-                if not cap.grab():
+    capture = cv2.VideoCapture(video_path)
+    if not capture.isOpened():
+        raise FileNotFoundError(video_path)
+    n_frames = int(capture.get(cv2.CAP_PROP_FRAME_COUNT)) or 1 << 30
+    crops = []
+    held_frame_index, held_image = -1, None      # the frame currently held in held_image
+    for job_index, job in camera_jobs:
+        frame_index = min(max(job.frame, 0), n_frames - 1)
+        if frame_index != held_frame_index:
+            if frame_index < held_frame_index or frame_index - held_frame_index > seek_gap:
+                capture.set(cv2.CAP_PROP_POS_FRAMES, frame_index)
+                held_frame_index = frame_index - 1
+            while held_frame_index < frame_index:
+                if not capture.grab():
                     break
-                pos += 1
-            ok, frm = cap.retrieve()
+                held_frame_index += 1
+            ok, decoded = capture.retrieve()
             if ok:
-                img = frm
-        if img is None:
+                held_image = decoded
+        if held_image is None:
             continue
-        c = _crop(img, *bb)
-        if c.size == 0:
+        crop = _crop(held_image, *job.box)
+        if crop.size == 0:
             continue
-        out.append((n, cv2.resize(np.ascontiguousarray(c), size)))
-    cap.release()
-    return out
+        crops.append((job_index, cv2.resize(np.ascontiguousarray(crop), size)))
+    capture.release()
+    return crops
 
 
-def embed_tracklets_video(tr, boxes, video_paths, K: int = 8, extractor=None,
-                          batch: int = 256, workers: int = 4, log=print):
-    """Like embed_tracklets, for one video per camera (video_paths[cam]). Cameras are
+def embed_tracklets_video(tracklet_table, boxes, video_paths, frames_per_tracklet: int = 8,
+                          extractor=None, batch_size: int = 256, workers: int = 4, log=print):
+    """Like embed_tracklets, for one video per camera (video_paths[camera_id]). Cameras are
     decoded in parallel threads (OpenCV releases the GIL); the GPU embeds each camera's
     crops as soon as that camera is done. Jobs whose frame cannot be read keep a zero
     feature (their tracklet is averaged over the remaining frames)."""
     import time
     from concurrent.futures import ThreadPoolExecutor, as_completed
     extractor = extractor or make_extractor()
-    jobs = _make_jobs(tr, boxes, K)
-    by_cam = {}
-    for n, j in enumerate(jobs):
-        by_cam.setdefault(j[2], []).append((n, j))
-    feats = np.zeros((len(jobs), 512), np.float32)
-    t0, missing = time.time(), 0
+    jobs = _make_crop_jobs(tracklet_table, boxes, frames_per_tracklet)
+    jobs_by_camera = {}
+    for job_index, job in enumerate(jobs):
+        jobs_by_camera.setdefault(job.camera_id, []).append((job_index, job))
+    job_features = np.zeros((len(jobs), FEATURE_DIM), np.float32)
+    start, n_missing = time.time(), 0
     with ThreadPoolExecutor(workers) as pool:
-        futs = {pool.submit(_read_camera_crops, video_paths[c], cj): c for c, cj in by_cam.items()}
-        for fut in as_completed(futs):
-            cam = futs[fut]
-            got = fut.result()
-            missing += len(by_cam[cam]) - len(got)
-            for s in range(0, len(got), batch):
-                part = got[s:s + batch]
-                f = extractor([c for _, c in part]).cpu().numpy()
-                feats[[n for n, _ in part]] = f[:, :512]
-            log(f"    cam {cam}: {len(got)} crops ({time.time() - t0:.0f} s)")
-    if missing:
-        log(f"    {missing} of {len(jobs)} crops unreadable (zero features, ignored in the mean)")
-    return _aggregate(jobs, feats, len(tr))
+        camera_of_future = {pool.submit(_read_camera_crops, video_paths[camera_id], camera_jobs): camera_id
+                            for camera_id, camera_jobs in jobs_by_camera.items()}
+        for future in as_completed(camera_of_future):
+            camera_id = camera_of_future[future]
+            crops = future.result()
+            n_missing += len(jobs_by_camera[camera_id]) - len(crops)
+            for batch_start in range(0, len(crops), batch_size):
+                batch = crops[batch_start:batch_start + batch_size]
+                batch_features = extractor([crop for _, crop in batch]).cpu().numpy()
+                job_features[[job_index for job_index, _ in batch]] = batch_features[:, :FEATURE_DIM]
+            log(f"    cam {camera_id}: {len(crops)} crops ({time.time() - start:.0f} s)")
+    if n_missing:
+        log(f"    {n_missing} of {len(jobs)} crops unreadable (zero features, ignored in the mean)")
+    return _aggregate(jobs, job_features, len(tracklet_table))
 
 
 def similarity_histograms(stream, max_pairs: int = 200000, seed: int = 0):
     """Cosine similarity of true-match vs false-match tracklet pairs (calibration figure).
     Uses the final vector of each tracklet."""
     rng = np.random.default_rng(seed)
-    final = {}
-    for i in range(len(stream.time)):
-        final[int(stream.tid[i])] = stream.vec[i]
-    tids = np.array(sorted(final))
-    V = np.stack([final[t] for t in tids])
-    gt = stream.gt[tids]
-    a = rng.integers(0, len(tids), max_pairs)
-    b = rng.integers(0, len(tids), max_pairs)
-    keep = a != b
-    a, b = a[keep], b[keep]
-    s = np.einsum("ij,ij->i", V[a], V[b])
-    same = gt[a] == gt[b]
+    final_vector_of = {}
+    for i in range(len(stream.event_times)):
+        final_vector_of[int(stream.event_tracklet_ids[i])] = stream.event_vectors[i]
+    tracklet_ids = np.array(sorted(final_vector_of))
+    vectors = np.stack([final_vector_of[tracklet_id] for tracklet_id in tracklet_ids])
+    gt_person_ids = stream.gt_person_ids[tracklet_ids]
+    index_a = rng.integers(0, len(tracklet_ids), max_pairs)
+    index_b = rng.integers(0, len(tracklet_ids), max_pairs)
+    keep = index_a != index_b
+    index_a, index_b = index_a[keep], index_b[keep]
+    pair_similarity = np.einsum("ij,ij->i", vectors[index_a], vectors[index_b])
+    same_person = gt_person_ids[index_a] == gt_person_ids[index_b]
     # oversample positives so both histograms are well populated
-    by_pid = {}
-    for k, g in enumerate(gt):
-        by_pid.setdefault(g, []).append(k)
-    pos = []
-    for idx in by_pid.values():
-        if len(idx) > 1:
-            for _ in range(min(50, len(idx))):
-                i, j = rng.choice(idx, 2, replace=False)
-                pos.append(float(V[i] @ V[j]))
-    return np.array(pos), s[~same]
+    indices_of_person = {}
+    for index, person_id in enumerate(gt_person_ids):
+        indices_of_person.setdefault(person_id, []).append(index)
+    positive_similarity = []
+    for indices in indices_of_person.values():
+        if len(indices) > 1:
+            for _ in range(min(50, len(indices))):
+                i, j = rng.choice(indices, 2, replace=False)
+                positive_similarity.append(float(vectors[i] @ vectors[j]))
+    return np.array(positive_similarity), pair_similarity[~same_person]

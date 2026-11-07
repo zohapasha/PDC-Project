@@ -12,63 +12,66 @@ from __future__ import annotations
 import heapq
 import time
 
-from ..common.constraints import Checker
+from ..common.constraints import ConstraintChecker
 
 
-def _accepted_edges(engine):
-    acc = engine.tau_accept
-    blocked = engine.blocked
-    E = []
-    for a, nb in engine.adj.items():
-        for b, w in nb.items():
-            if a < b and w >= acc and (a, b) not in blocked and (b, a) not in blocked:
-                E.append((w, a, b))
-    return E
+def _accepted_matches(engine):
+    """[(score, tracklet_a, tracklet_b)] for every stored, unblocked match >= tau_accept."""
+    tau_accept = engine.tau_accept
+    blocked_pairs = engine.blocked_pairs
+    accepted = []
+    for tracklet_a, scores_of_a in engine.match_scores.items():
+        for tracklet_b, score in scores_of_a.items():
+            if (tracklet_a < tracklet_b and score >= tau_accept
+                    and (tracklet_a, tracklet_b) not in blocked_pairs
+                    and (tracklet_b, tracklet_a) not in blocked_pairs):
+                accepted.append((score, tracklet_a, tracklet_b))
+    return accepted
 
 
-def full_recompute(engine, checker: Checker | None = None):
+def _make_find_root(union_parent):
+    def find_root(tracklet_id):
+        while union_parent[tracklet_id] != tracklet_id:
+            union_parent[tracklet_id] = union_parent[union_parent[tracklet_id]]
+            tracklet_id = union_parent[tracklet_id]
+        return tracklet_id
+    return find_root
+
+
+def full_recompute(engine, checker: ConstraintChecker | None = None):
     """Returns (partition, seconds)."""
-    t0 = time.perf_counter()
-    chk = checker or engine.chk
-    V = engine.V
-    E = _accepted_edges(engine)
-    E.sort(key=lambda x: -x[0])
-    parent = {t: t for t in V}
-    visits = {t: [(v.ts, v.te, v.cam, t)] for t, v in V.items()}
+    start = time.perf_counter()
+    checker = checker or engine.checker
+    vertices = engine.vertices
+    accepted = _accepted_matches(engine)
+    accepted.sort(key=lambda match: -match[0])
+    union_parent = {tracklet_id: tracklet_id for tracklet_id in vertices}
+    visits_of_root = {tracklet_id: [(vertex.start_time, vertex.end_time, vertex.camera_id, tracklet_id)]
+                      for tracklet_id, vertex in vertices.items()}
+    find_root = _make_find_root(union_parent)
 
-    def find(x):
-        while parent[x] != x:
-            parent[x] = parent[parent[x]]
-            x = parent[x]
-        return x
-
-    for w, a, b in E:
-        ra, rb = find(a), find(b)
-        if ra == rb:
+    for _, tracklet_a, tracklet_b in accepted:
+        root_a, root_b = find_root(tracklet_a), find_root(tracklet_b)
+        if root_a == root_b:
             continue
-        va, vb = visits[ra], visits[rb]
-        if chk.can_merge(va, vb)[0]:
-            if len(va) > len(vb):
-                ra, rb, va, vb = rb, ra, vb, va
-            parent[ra] = rb
-            visits[rb] = list(heapq.merge(va, vb))
-            del visits[ra]
-    part = {t: find(t) for t in V}
-    return part, time.perf_counter() - t0
+        visits_a, visits_b = visits_of_root[root_a], visits_of_root[root_b]
+        if checker.can_merge(visits_a, visits_b)[0]:
+            if len(visits_a) > len(visits_b):
+                root_a, root_b, visits_a, visits_b = root_b, root_a, visits_b, visits_a
+            union_parent[root_a] = root_b
+            visits_of_root[root_b] = list(heapq.merge(visits_a, visits_b))
+            del visits_of_root[root_a]
+    partition = {tracklet_id: find_root(tracklet_id) for tracklet_id in vertices}
+    return partition, time.perf_counter() - start
 
 
 def connected_components(engine):
-    V = engine.V
-    parent = {t: t for t in V}
+    vertices = engine.vertices
+    union_parent = {tracklet_id: tracklet_id for tracklet_id in vertices}
+    find_root = _make_find_root(union_parent)
 
-    def find(x):
-        while parent[x] != x:
-            parent[x] = parent[parent[x]]
-            x = parent[x]
-        return x
-
-    for w, a, b in _accepted_edges(engine):
-        ra, rb = find(a), find(b)
-        if ra != rb:
-            parent[ra] = rb
-    return {t: find(t) for t in V}
+    for _, tracklet_a, tracklet_b in _accepted_matches(engine):
+        root_a, root_b = find_root(tracklet_a), find_root(tracklet_b)
+        if root_a != root_b:
+            union_parent[root_a] = root_b
+    return {tracklet_id: find_root(tracklet_id) for tracklet_id in vertices}

@@ -15,227 +15,255 @@ import time
 import msgpack
 import numpy as np
 
-from . import protocol as P
+from ..common.types import EVENT_TRACKLET
+from . import protocol
 
-_SITE_PORT0 = 0
-_HUB_PORT = 1
+_HUB_PORT_OFFSET = 1          # hub PULL socket: base_port + 1
+_SITE_PORT_OFFSET = 2         # site k PULL socket: base_port + 2 + k
+
+# Control messages on the player/hub -> site sockets and the site -> hub socket
+_PLAYER_END = -1              # player -> site: no more events; site -> hub: [-1, site_id]
+_HUB_SPLIT_REQUEST = -2       # hub -> site: [-2, tracklet_a, tracklet_b]
+_HUB_FINISH = -3              # hub -> site: hub has everything; exit
+_SPLIT_REPLY_EVENT = 2        # event type in the instrumentation frame of a SplitRequest reply
+
+_BLAS_THREAD_ENV_VARS = ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
+                         "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS")
 
 
-class _RSS:
+def _address(port):
+    return f"tcp://127.0.0.1:{port}"
+
+
+class _PeakRssSampler:
     """Samples this process's RSS every 0.5 s; keeps the peak."""
 
     def __init__(self):
         import psutil
-        self.p = psutil.Process()
-        self.peak = self.p.memory_info().rss
-        self._stop = False
-        self.t = threading.Thread(target=self._run, daemon=True)
-        self.t.start()
+        self.process = psutil.Process()
+        self.peak_bytes = self.process.memory_info().rss
+        self._stopped = False
+        self.thread = threading.Thread(target=self._sample_loop, daemon=True)
+        self.thread.start()
 
-    def _run(self):
-        while not self._stop:
-            self.peak = max(self.peak, self.p.memory_info().rss)
+    def _sample_loop(self):
+        while not self._stopped:
+            self.peak_bytes = max(self.peak_bytes, self.process.memory_info().rss)
             time.sleep(0.5)
 
     def stop(self):
-        self._stop = True
-        self.peak = max(self.peak, self.p.memory_info().rss)
-        return self.peak
+        self._stopped = True
+        self.peak_bytes = max(self.peak_bytes, self.process.memory_info().rss)
+        return self.peak_bytes
 
 
-def _cpu(p):
-    c = p.cpu_times()
-    return c.user + c.system
+def _cpu_seconds(process):
+    cpu_times = process.cpu_times()
+    return cpu_times.user + cpu_times.system
 
 
 # ======================================================================== site
-def _site_main(sid, topo_json, cfg, mode, base_port, ready, start, q):
+def _site_main(site_id, topology_json, engine_config, mode, base_port, ready_event,
+               start_event, result_queue):
     import psutil
     import zmq
     from ..common.topology import Topology
     from .nodes import Site
-    topo = Topology.from_json(topo_json)
-    ctx = zmq.Context()
-    pull = ctx.socket(zmq.PULL)
-    pull.bind(f"tcp://127.0.0.1:{base_port + 2 + sid}")
-    push = ctx.socket(zmq.PUSH)
-    push.connect(f"tcp://127.0.0.1:{base_port + _HUB_PORT}")
-    site = Site(topo, sid, cfg) if mode == "two_level" else None
-    rss = _RSS()
-    proc = psutil.Process()
-    ready.set()
-    start.wait()
-    lat = []
-    nbytes = {}
-    cpu0, w0 = _cpu(proc), time.perf_counter()
-    unpack, pc = msgpack.unpackb, time.perf_counter_ns
-    def ship(t_arr, et, msgs):
-        frames = [msgpack.packb([t_arr, et])]
-        for m in msgs:
-            b = P.pack(m)
-            nbytes[m[0]] = nbytes.get(m[0], 0) + len(b)
-            frames.append(b)
-        push.send_multipart(frames)
+    topology = Topology.from_json(topology_json)
+    zmq_context = zmq.Context()
+    pull_socket = zmq_context.socket(zmq.PULL)
+    pull_socket.bind(_address(base_port + _SITE_PORT_OFFSET + site_id))
+    push_socket = zmq_context.socket(zmq.PUSH)
+    push_socket.connect(_address(base_port + _HUB_PORT_OFFSET))
+    site = Site(topology, site_id, engine_config) if mode == "two_level" else None
+    rss_sampler = _PeakRssSampler()
+    process = psutil.Process()
+    ready_event.set()
+    start_event.wait()
+    latencies_ns = []
+    bytes_by_type = {}
+    cpu_start, wall_start = _cpu_seconds(process), time.perf_counter()
+    unpack, clock_ns = msgpack.unpackb, time.perf_counter_ns
 
-    # Player events: [etype, tid, cam, ts, te, vec]; player END: [-1].
-    # Hub messages: [-2, a, b] SplitRequest; [-3] FIN (hub has everything; exit).
+    def send_to_hub(arrival_ns, event_type, messages):
+        frames = [msgpack.packb([arrival_ns, event_type])]
+        for message in messages:
+            packed = protocol.pack(message)
+            bytes_by_type[message[0]] = bytes_by_type.get(message[0], 0) + len(packed)
+            frames.append(packed)
+        push_socket.send_multipart(frames)
+
+    # Player events: [event_type, tracklet_id, camera_id, start, end, vector_bytes].
     while True:
-        raw = pull.recv()
-        t_arr = pc()
-        ev = unpack(raw)
-        if ev[0] == -1:
-            push.send_multipart([msgpack.packb([-1, sid])])
+        raw = pull_socket.recv()
+        arrival_ns = clock_ns()
+        event = unpack(raw)
+        if event[0] == _PLAYER_END:
+            push_socket.send_multipart([msgpack.packb([_PLAYER_END, site_id])])
             continue
-        if ev[0] == -3:
+        if event[0] == _HUB_FINISH:
             break
-        if ev[0] == -2:                             # SplitRequest; et=2 marks the reply
-            ship(t_arr, 2, site.on_split(ev[1], ev[2]))
+        if event[0] == _HUB_SPLIT_REQUEST:
+            send_to_hub(arrival_ns, _SPLIT_REPLY_EVENT, site.on_split_request(event[1], event[2]))
             continue
-        et, tid, cam, ts, te, vb = ev
+        event_type, tracklet_id, camera_id, start_time, end_time, vector_bytes = event
         if site is not None:
-            vec = np.frombuffer(vb, np.float32)
-            msgs = site.on_tracklet(tid, cam, ts, te, vec) if et == 0 else site.on_revise(tid, cam, vec)
-        else:                                       # centralized: forward everything
-            msgs = [[P.FT, tid, cam, ts, te, vb]] if et == 0 else [[P.FR, tid, vb]]
-        lat.append(pc() - t_arr)
-        ship(t_arr, et, msgs)
-    wall = time.perf_counter() - w0
-    res = {"sid": sid, "site_lat_ns": np.array(lat, np.int64), "bytes": nbytes,
-           "rss_peak": rss.stop(), "cpu_s": _cpu(proc) - cpu0, "wall_s": wall}
+            vector = np.frombuffer(vector_bytes, np.float32)
+            if event_type == EVENT_TRACKLET:
+                messages = site.on_tracklet(tracklet_id, camera_id, start_time, end_time, vector)
+            else:
+                messages = site.on_revise(tracklet_id, camera_id, vector)
+        elif event_type == EVENT_TRACKLET:           # centralized: forward everything
+            messages = [[protocol.MSG_FULL_TRACKLET, tracklet_id, camera_id, start_time,
+                         end_time, vector_bytes]]
+        else:
+            messages = [[protocol.MSG_FULL_REVISE, tracklet_id, vector_bytes]]
+        latencies_ns.append(clock_ns() - arrival_ns)
+        send_to_hub(arrival_ns, event_type, messages)
+    wall_seconds = time.perf_counter() - wall_start
+    result = {"site_id": site_id, "site_latency_ns": np.array(latencies_ns, np.int64),
+              "bytes": bytes_by_type, "peak_rss_bytes": rss_sampler.stop(),
+              "cpu_seconds": _cpu_seconds(process) - cpu_start, "wall_seconds": wall_seconds}
     if site is not None:
-        res["oplog"] = site.node.engine.oplog
-        res["partition"] = site.node.engine.partition()
-    q.put(("site", res))
+        result["op_log"] = site.node.engine.op_log
+        result["partition"] = site.node.engine.partition()
+    result_queue.put(("site", result))
     time.sleep(0.2)
-    push.close(linger=-1)                           # never drop the END marker
-    pull.close()
-    ctx.term()
+    push_socket.close(linger=-1)                    # never drop the END marker
+    pull_socket.close()
+    zmq_context.term()
 
 
 # ======================================================================== hub
-def _hub_main(n_sites, topo_json, cfg, mode, base_port, ready, start, q):
+def _hub_main(n_sites, topology_json, engine_config, mode, base_port, ready_event,
+              start_event, result_queue):
     import psutil
     import zmq
     from ..common.topology import Topology
     from .nodes import CentralHub, Hub
-    topo = Topology.from_json(topo_json)
-    ctx = zmq.Context()
-    pull = ctx.socket(zmq.PULL)
-    pull.bind(f"tcp://127.0.0.1:{base_port + _HUB_PORT}")
-    hub = Hub(topo, cfg) if mode == "two_level" else CentralHub(topo, cfg)
-    to_site = []
-    for sid in range(n_sites):
-        so = ctx.socket(zmq.PUSH)
-        so.connect(f"tcp://127.0.0.1:{base_port + 2 + sid}")
-        to_site.append(so)
-    rss = _RSS()
-    proc = psutil.Process()
-    ready.set()
-    start.wait()
-    lat = []
-    ended = 0
-    n_msgs = 0
-    outstanding = 0                                 # SplitRequests not yet answered
-    sr_bytes = 0
-    cpu0, w0 = _cpu(proc), time.perf_counter()
-    t_first = None
-    unpack, pc = P.unpack, time.perf_counter_ns
-    split = mode == "two_level"
-    while ended < n_sites or outstanding > 0:
-        frames = pull.recv_multipart()
-        head = msgpack.unpackb(frames[0])
-        if head[0] == -1:
-            ended += 1
+    topology = Topology.from_json(topology_json)
+    zmq_context = zmq.Context()
+    pull_socket = zmq_context.socket(zmq.PULL)
+    pull_socket.bind(_address(base_port + _HUB_PORT_OFFSET))
+    hub = Hub(topology, engine_config) if mode == "two_level" else CentralHub(topology, engine_config)
+    site_sockets = []
+    for site_id in range(n_sites):
+        site_socket = zmq_context.socket(zmq.PUSH)
+        site_socket.connect(_address(base_port + _SITE_PORT_OFFSET + site_id))
+        site_sockets.append(site_socket)
+    rss_sampler = _PeakRssSampler()
+    process = psutil.Process()
+    ready_event.set()
+    start_event.wait()
+    latencies = []                                  # (end-to-end ns, event_type)
+    n_sites_ended = 0
+    n_messages = 0
+    outstanding_split_requests = 0                  # SplitRequests not yet answered
+    split_request_bytes = 0
+    cpu_start, wall_start = _cpu_seconds(process), time.perf_counter()
+    first_message_ns = None
+    unpack, clock_ns = protocol.unpack, time.perf_counter_ns
+    sends_split_requests = mode == "two_level"
+    while n_sites_ended < n_sites or outstanding_split_requests > 0:
+        frames = pull_socket.recv_multipart()
+        arrival_ns, event_type = msgpack.unpackb(frames[0])
+        if arrival_ns == _PLAYER_END:
+            n_sites_ended += 1
             continue
-        if t_first is None:
-            t_first = pc()
-        if head[1] == 2:
-            outstanding -= 1
-        for b in frames[1:]:
-            back = hub.handle(unpack(b))
-            if split and back:
-                for sid, sr in back:
-                    sr_bytes += len(P.pack(sr))
-                    to_site[sid].send(msgpack.packb([-2, sr[1], sr[2]]))
-                    outstanding += 1
-        n_msgs += len(frames) - 1
-        if head[1] != 2:
-            lat.append((pc() - head[0], head[1]))
-    for so in to_site:
-        so.send(msgpack.packb([-3]))
-    t_end = pc()
-    wall = time.perf_counter() - w0
-    eng = hub.eng
-    res = {"e2e_lat_ns": np.array([x[0] for x in lat], np.int64),
-           "e2e_etype": np.array([x[1] for x in lat], np.int8),
-           "t_end_ns": t_end, "t_first_ns": t_first, "n_msgs": n_msgs,
-           "rss_peak": rss.stop(), "cpu_s": _cpu(proc) - cpu0, "wall_s": wall,
-           "partition": eng.partition(), "oplog": eng.oplog,
-           "n_split": getattr(hub, "n_split", 0), "sr_bytes": sr_bytes}
-    q.put(("hub", res))
-    for so in to_site:
-        so.close(linger=-1)
-    pull.close()
-    ctx.term()
+        if first_message_ns is None:
+            first_message_ns = clock_ns()
+        if event_type == _SPLIT_REPLY_EVENT:
+            outstanding_split_requests -= 1
+        for packed in frames[1:]:
+            split_requests = hub.handle(unpack(packed))
+            if sends_split_requests and split_requests:
+                for site_id, split_request in split_requests:
+                    split_request_bytes += len(protocol.pack(split_request))
+                    site_sockets[site_id].send(msgpack.packb(
+                        [_HUB_SPLIT_REQUEST, split_request[1], split_request[2]]))
+                    outstanding_split_requests += 1
+        n_messages += len(frames) - 1
+        if event_type != _SPLIT_REPLY_EVENT:
+            latencies.append((clock_ns() - arrival_ns, event_type))
+    for site_socket in site_sockets:
+        site_socket.send(msgpack.packb([_HUB_FINISH]))
+    end_ns = clock_ns()
+    wall_seconds = time.perf_counter() - wall_start
+    engine = hub.engine
+    result = {"e2e_latency_ns": np.array([latency for latency, _ in latencies], np.int64),
+              "e2e_event_type": np.array([event_type for _, event_type in latencies], np.int8),
+              "end_ns": end_ns, "first_message_ns": first_message_ns, "n_messages": n_messages,
+              "peak_rss_bytes": rss_sampler.stop(), "cpu_seconds": _cpu_seconds(process) - cpu_start,
+              "wall_seconds": wall_seconds, "partition": engine.partition(), "op_log": engine.op_log,
+              "n_split_requests": getattr(hub, "n_split_requests", 0),
+              "split_request_bytes": split_request_bytes}
+    result_queue.put(("hub", result))
+    for site_socket in site_sockets:
+        site_socket.close(linger=-1)
+    pull_socket.close()
+    zmq_context.term()
 
 
 # ======================================================================== player
-def _player_main(stream_path, topo_json, base_port, speed, ready, start, q):
+def _player_main(stream_path, topology_json, base_port, speed, ready_event, start_event,
+                 result_queue):
     import zmq
     from ..common.topology import Topology
     from ..gen.campus import Stream
-    s = Stream.load(stream_path)
-    topo = Topology.from_json(topo_json)
-    ctx = zmq.Context()
-    socks = []
-    for sid in range(topo.n_sites):
-        so = ctx.socket(zmq.PUSH)
-        so.connect(f"tcp://127.0.0.1:{base_port + 2 + sid}")
-        socks.append(so)
-    site_of = topo.site
+    stream = Stream.load(stream_path)
+    topology = Topology.from_json(topology_json)
+    zmq_context = zmq.Context()
+    site_sockets = []
+    for site_id in range(topology.n_sites):
+        site_socket = zmq_context.socket(zmq.PUSH)
+        site_socket.connect(_address(base_port + _SITE_PORT_OFFSET + site_id))
+        site_sockets.append(site_socket)
+    site_of_camera = topology.site_of_camera
     # pre-encode events (excluded from timing)
-    enc, dest, when = [], [], []
-    for i in range(len(s.time)):
-        t = int(s.tid[i])
-        c = int(s.cam[t])
-        enc.append(msgpack.packb([int(s.etype[i]), t, c, float(s.ts[t]), float(s.te[t]),
-                                  s.vec[i].tobytes()]))
-        dest.append(int(site_of[c]))
-        when.append(float(s.time[i]))
-    t_base = when[0] if when else 0.0
-    ready.set()
-    start.wait()
-    t0 = time.perf_counter_ns()
-    w0 = time.perf_counter()
-    for i in range(len(enc)):
+    encoded_events, destination_sites, event_times = [], [], []
+    for i in range(len(stream.event_times)):
+        tracklet_id = int(stream.event_tracklet_ids[i])
+        camera_id = int(stream.camera_ids[tracklet_id])
+        encoded_events.append(msgpack.packb([
+            int(stream.event_types[i]), tracklet_id, camera_id,
+            float(stream.start_times[tracklet_id]), float(stream.end_times[tracklet_id]),
+            stream.event_vectors[i].tobytes()]))
+        destination_sites.append(int(site_of_camera[camera_id]))
+        event_times.append(float(stream.event_times[i]))
+    first_event_time = event_times[0] if event_times else 0.0
+    ready_event.set()
+    start_event.wait()
+    start_ns = time.perf_counter_ns()
+    wall_start = time.perf_counter()
+    for i in range(len(encoded_events)):
         if speed:
-            target = w0 + (when[i] - t_base) / speed
-            dt = target - time.perf_counter()
-            if dt > 0.002:
-                time.sleep(dt - 0.001)
-            while time.perf_counter() < target:
+            target = wall_start + (event_times[i] - first_event_time) / speed
+            remaining = target - time.perf_counter()
+            if remaining > 0.002:
+                time.sleep(remaining - 0.001)
+            while time.perf_counter() < target:      # spin for the last millisecond
                 pass
-        socks[dest[i]].send(enc[i])
-    for so in socks:
-        so.send(msgpack.packb([-1]))
-    q.put(("player", {"t0_ns": t0, "n_events": len(enc),
-                      "send_s": time.perf_counter() - w0}))
-    for so in socks:
-        so.close(linger=-1)
-    ctx.term()
+        site_sockets[destination_sites[i]].send(encoded_events[i])
+    for site_socket in site_sockets:
+        site_socket.send(msgpack.packb([_PLAYER_END]))
+    result_queue.put(("player", {"start_ns": start_ns, "n_events": len(encoded_events),
+                                 "send_seconds": time.perf_counter() - wall_start}))
+    for site_socket in site_sockets:
+        site_socket.close(linger=-1)
+    zmq_context.term()
 
 
-def _guard(fn, q, *args):
+def _report_errors(target, result_queue, *args):
     try:
-        fn(*args)
+        target(*args)
     except BaseException:
         import traceback
-        q.put(("error", traceback.format_exc()))
+        result_queue.put(("error", traceback.format_exc()))
         raise
 
 
 # ======================================================================== driver
-def run_mp(stream_path: str, topo, cfg: dict, mode: str = "two_level", speed=None,
+def run_mp(stream_path: str, topology, engine_config: dict, mode: str = "two_level", speed=None,
            base_port: int | None = None, timeout: float = 1200.0,
            blas_threads: int | None = None) -> dict:
     """mode: 'two_level' (ours) or 'central' (B5). speed=None replays as fast as possible
@@ -244,66 +272,67 @@ def run_mp(stream_path: str, topo, cfg: dict, mode: str = "two_level", speed=Non
     spawned, so they read the environment when they import numpy). On a machine with few
     cores, uncapped BLAS pools of the hub, every site and the player oversubscribe the CPU.
     None leaves the library defaults (as in the synthetic runs)."""
-    ctxm = mp.get_context("spawn")
+    mp_context = mp.get_context("spawn")
     base_port = base_port or (20000 + (os.getpid() * 7 + int(time.time())) % 20000)
-    n = topo.n_sites
-    tj = topo.to_json()
-    q = ctxm.Queue()
-    start = ctxm.Event()
-    readies = [ctxm.Event() for _ in range(n + 2)]
-    procs = [ctxm.Process(target=_guard, args=(_hub_main, q, n, tj, cfg, mode, base_port,
-                                               readies[0], start, q))]
-    for sid in range(n):
-        procs.append(ctxm.Process(target=_guard, args=(_site_main, q, sid, tj, cfg, mode,
-                                                       base_port, readies[1 + sid], start, q)))
-    procs.append(ctxm.Process(target=_guard, args=(_player_main, q, stream_path, tj, base_port,
-                                                   speed, readies[-1], start, q)))
-    env_keys = ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
-                "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS")
-    saved = {k: os.environ.get(k) for k in env_keys}
+    n_sites = topology.n_sites
+    topology_json = topology.to_json()
+    result_queue = mp_context.Queue()
+    start_event = mp_context.Event()
+    ready_events = [mp_context.Event() for _ in range(n_sites + 2)]   # hub, sites..., player
+    processes = [mp_context.Process(target=_report_errors, args=(
+        _hub_main, result_queue, n_sites, topology_json, engine_config, mode, base_port,
+        ready_events[0], start_event, result_queue))]
+    for site_id in range(n_sites):
+        processes.append(mp_context.Process(target=_report_errors, args=(
+            _site_main, result_queue, site_id, topology_json, engine_config, mode, base_port,
+            ready_events[1 + site_id], start_event, result_queue)))
+    processes.append(mp_context.Process(target=_report_errors, args=(
+        _player_main, result_queue, stream_path, topology_json, base_port, speed,
+        ready_events[-1], start_event, result_queue)))
+    saved_env = {name: os.environ.get(name) for name in _BLAS_THREAD_ENV_VARS}
     if blas_threads:
-        for k in env_keys:
-            os.environ[k] = str(int(blas_threads))
+        for name in _BLAS_THREAD_ENV_VARS:
+            os.environ[name] = str(int(blas_threads))
     try:
-        for p in procs:
-            p.start()
+        for process in processes:
+            process.start()
     finally:
-        for k, v in saved.items():
-            if v is None:
-                os.environ.pop(k, None)
+        for name, value in saved_env.items():
+            if value is None:
+                os.environ.pop(name, None)
             else:
-                os.environ[k] = v
-    for r in readies:
-        if not r.wait(timeout=300):
-            for p in procs:
-                p.kill()
+                os.environ[name] = value
+    for ready_event in ready_events:
+        if not ready_event.wait(timeout=300):
+            for process in processes:
+                process.kill()
             raise RuntimeError("process failed to become ready")
     time.sleep(0.5)                                 # let zmq connections settle
-    start.set()
-    out = {"sites": []}
+    start_event.set()
+    results = {"sites": []}
     deadline = time.time() + timeout
-    import queue as _queue
+    import queue
     try:
-        while len(out["sites"]) < n or "hub" not in out or "player" not in out:
+        while len(results["sites"]) < n_sites or "hub" not in results or "player" not in results:
             try:
-                kind, res = q.get(timeout=max(1.0, deadline - time.time()))
-            except _queue.Empty:
-                alive = [p.name for p in procs if p.is_alive()]
+                kind, result = result_queue.get(timeout=max(1.0, deadline - time.time()))
+            except queue.Empty:
+                alive = [process.name for process in processes if process.is_alive()]
                 raise TimeoutError(f"run_mp timed out after {timeout}s; got "
-                                   f"{sorted(k for k in out if out[k])}, alive={alive}")
+                                   f"{sorted(k for k in results if results[k])}, alive={alive}")
             if kind == "error":
-                raise RuntimeError("child process failed: " + res)
+                raise RuntimeError("child process failed: " + result)
             if kind == "site":
-                out["sites"].append(res)
+                results["sites"].append(result)
             else:
-                out[kind] = res
-        for p in procs:
-            p.join(timeout=30)
+                results[kind] = result
+        for process in processes:
+            process.join(timeout=30)
     finally:
-        for p in procs:
-            if p.is_alive():
-                p.kill()
-    hub, pl = out["hub"], out["player"]
-    out["elapsed_s"] = (hub["t_end_ns"] - pl["t0_ns"]) / 1e9
-    out["throughput"] = pl["n_events"] / out["elapsed_s"]
-    return out
+        for process in processes:
+            if process.is_alive():
+                process.kill()
+    hub_result, player_result = results["hub"], results["player"]
+    results["elapsed_s"] = (hub_result["end_ns"] - player_result["start_ns"]) / 1e9
+    results["throughput"] = player_result["n_events"] / results["elapsed_s"]
+    return results

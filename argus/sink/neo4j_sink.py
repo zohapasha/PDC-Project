@@ -1,55 +1,59 @@
 """Optional persistence sink (OFF for all timed experiments).
 
-Consumes hub BelongsTo deltas ("B", tid, old_pid, new_pid) and writes them to Neo4j in
-batches with UNWIND, off the critical path:
+Consumes hub BelongsTo deltas ("B", tracklet_id, old_person_id, new_person_id) and writes
+them to Neo4j in batches with UNWIND, off the critical path:
 
     (:Tracklet {tid, cam, t_start, t_end})-[:BELONGS_TO]->(:Person {pid})
 
     pip install neo4j
     sink = Neo4jSink("bolt://localhost:7687", ("neo4j", "password"))
-    hub = Hub(topo, cfg, emit_belongs=True)
-    ... after handling messages:  sink.push(hub.eng.out); hub.eng.out.clear()
+    hub = Hub(topology, engine_config, emit_belongs_to=True)
+    ... after handling messages:
+        sink.push(hub.engine.emitted_deltas); hub.engine.emitted_deltas.clear()
 """
 from __future__ import annotations
 
-UPSERT = """
-UNWIND $rows AS r
-MERGE (t:Tracklet {tid: r.tid})
-MERGE (p:Person {pid: r.new})
-WITH t, p, r
+from ..common.types import DELTA_BELONGS_TO
+
+UPSERT_QUERY = """
+UNWIND $rows AS row
+MERGE (t:Tracklet {tid: row.tid})
+MERGE (p:Person {pid: row.new})
+WITH t, p, row
 OPTIONAL MATCH (t)-[old:BELONGS_TO]->(:Person)
 DELETE old
 MERGE (t)-[:BELONGS_TO]->(p)
 """
-CLEANUP = "MATCH (p:Person) WHERE NOT (p)<-[:BELONGS_TO]-() DELETE p"
+CLEANUP_QUERY = "MATCH (p:Person) WHERE NOT (p)<-[:BELONGS_TO]-() DELETE p"
 
 
 class Neo4jSink:
-    def __init__(self, uri, auth, batch: int = 5000):
+    def __init__(self, uri, auth, batch_size: int = 5000):
         from neo4j import GraphDatabase
         self.driver = GraphDatabase.driver(uri, auth=auth)
-        self.batch = batch
-        self.buf = []
-        with self.driver.session() as s:
-            s.run("CREATE CONSTRAINT IF NOT EXISTS FOR (t:Tracklet) REQUIRE t.tid IS UNIQUE")
-            s.run("CREATE CONSTRAINT IF NOT EXISTS FOR (p:Person) REQUIRE p.pid IS UNIQUE")
+        self.batch_size = batch_size
+        self.buffered_rows = []
+        with self.driver.session() as session:
+            session.run("CREATE CONSTRAINT IF NOT EXISTS FOR (t:Tracklet) REQUIRE t.tid IS UNIQUE")
+            session.run("CREATE CONSTRAINT IF NOT EXISTS FOR (p:Person) REQUIRE p.pid IS UNIQUE")
 
     def push(self, deltas):
-        for d in deltas:
-            if d[0] == "B":
-                self.buf.append({"tid": d[1], "new": d[3]})
-        if len(self.buf) >= self.batch:
+        for delta in deltas:
+            if delta[0] == DELTA_BELONGS_TO:
+                _, tracklet_id, _, new_person_id = delta
+                self.buffered_rows.append({"tid": tracklet_id, "new": new_person_id})
+        if len(self.buffered_rows) >= self.batch_size:
             self.flush()
 
     def flush(self):
-        if not self.buf:
+        if not self.buffered_rows:
             return
         # last write per tracklet wins inside a batch
-        last = {r["tid"]: r for r in self.buf}
-        with self.driver.session() as s:
-            s.run(UPSERT, rows=list(last.values()))
-            s.run(CLEANUP)
-        self.buf = []
+        last_row_of_tracklet = {row["tid"]: row for row in self.buffered_rows}
+        with self.driver.session() as session:
+            session.run(UPSERT_QUERY, rows=list(last_row_of_tracklet.values()))
+            session.run(CLEANUP_QUERY)
+        self.buffered_rows = []
 
     def close(self):
         self.flush()

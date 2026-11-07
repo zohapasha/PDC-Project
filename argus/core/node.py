@@ -7,54 +7,60 @@ from ..common.types import INF
 from .engine import IdentityEngine
 from .matcher import Matcher
 
+_PRUNE_EVERY = 256       # prune the matcher every this many matched tracklets (power of 2)
+
 
 class IdentityNode:
-    def __init__(self, topo: Topology, cfg: dict, match_cams=None, cross_site_only=False,
-                 mode: str = "full", emit: bool = False, emit_belongs: bool = False,
-                 log_ops: bool = True):
-        self.engine = IdentityEngine(topo, cfg["tau_accept"], cfg["tau_keep"], mode=mode,
-                                     emit=emit, emit_belongs=emit_belongs, log_ops=log_ops)
-        self.matcher = Matcher(topo, cfg["W"], cfg["tau_keep"], cams=match_cams,
-                               cross_site_only=cross_site_only,
-                               D_max=cfg.get("D_max", 600.0))
-        self.fixed = None                        # hub: predicate for site-owned matches
-        self.max_dur = 1.0
-        self._n = 0
+    def __init__(self, topology: Topology, engine_config: dict, match_camera_ids=None,
+                 cross_site_only=False, mode: str = "full", emit_tree_deltas: bool = False,
+                 emit_belongs_to: bool = False, log_ops: bool = True):
+        self.engine = IdentityEngine(topology, engine_config["tau_accept"],
+                                     engine_config["tau_keep"], mode=mode,
+                                     emit_tree_deltas=emit_tree_deltas,
+                                     emit_belongs_to=emit_belongs_to, log_ops=log_ops)
+        self.matcher = Matcher(topology, engine_config["window_slack"], engine_config["tau_keep"],
+                               camera_ids=match_camera_ids, cross_site_only=cross_site_only,
+                               max_walk_time=engine_config.get("max_walk_time", 600.0))
+        self.is_site_owned_match = None          # hub: predicate for site-owned matches
+        self.max_tracklet_duration = 1.0
+        self._n_matched_tracklets = 0
 
-    def on_tracklet(self, tid, cam, ts, te, vec=None, tag=-1):
-        eng, m = self.engine, self.matcher
-        eng.add_vertex(tid, cam, ts, te, tag)
-        if te - ts > self.max_dur:
-            self.max_dur = te - ts
-        if vec is None or cam not in m.cams:
+    def on_tracklet(self, tracklet_id, camera_id, start_time, end_time, vector=None, site_tag=-1):
+        engine, matcher = self.engine, self.matcher
+        engine.add_vertex(tracklet_id, camera_id, start_time, end_time, site_tag)
+        if end_time - start_time > self.max_tracklet_duration:
+            self.max_tracklet_duration = end_time - start_time
+        if vector is None or camera_id not in matcher.camera_ids:
             return
-        cands = m.candidates(cam, ts, vec)
-        m.add(tid, cam, ts, te, vec)
-        for o, sc in cands:                      # strongest first
-            eng.add_match(tid, o, sc)
-        self._n += 1
-        if self._n & 255 == 0:
-            m.prune(te, self.max_dur)
+        candidates = matcher.candidates(camera_id, start_time, vector)
+        matcher.add(tracklet_id, camera_id, start_time, end_time, vector)
+        for other_id, score in candidates:            # strongest first
+            engine.add_match(tracklet_id, other_id, score)
+        self._n_matched_tracklets += 1
+        if self._n_matched_tracklets & (_PRUNE_EVERY - 1) == 0:
+            matcher.prune(end_time, self.max_tracklet_duration)
 
-    def on_revise(self, tid, vec):
+    def on_revise(self, tracklet_id, vector):
         """The tracklet's final appearance vector replaces a provisional one: re-score its
         stored matches (may trigger evidence-driven deletions) and look for new ones."""
-        eng, m = self.engine, self.matcher
-        if not m.update_vec(tid, vec):
+        engine, matcher = self.engine, self.matcher
+        if not matcher.update_vector(tracklet_id, vector):
             return
-        adj = eng.adj.get(tid)
-        if adj is None:
+        stored_scores = engine.match_scores.get(tracklet_id)
+        if stored_scores is None:
             return
-        for o, old in list(adj.items()):
-            if old == INF or (self.fixed is not None and self.fixed(tid, o)):
-                continue                         # site-owned link at the hub: site scores it
-            ov = m.get(o)
-            if ov is not None:
-                eng.update_match(tid, o, float(ov @ vec))
-        cam, ts, _ = m.meta(tid)
-        ex = set(eng.adj[tid])
-        ex.add(tid)
-        new = m.candidates(cam, ts, vec, exclude=ex) + m.candidates_fwd(tid, vec, exclude=ex)
-        new.sort(key=lambda x: -x[1])
-        for o, sc in new:
-            eng.add_match(tid, o, sc)
+        for other_id, old_score in list(stored_scores.items()):
+            if old_score == INF or (self.is_site_owned_match is not None
+                                    and self.is_site_owned_match(tracklet_id, other_id)):
+                continue                   # site-owned link at the hub: the site scores it
+            other_vector = matcher.get_vector(other_id)
+            if other_vector is not None:
+                engine.update_match(tracklet_id, other_id, float(other_vector @ vector))
+        camera_id, start_time, _ = matcher.metadata(tracklet_id)
+        exclude = set(engine.match_scores[tracklet_id])
+        exclude.add(tracklet_id)
+        new_candidates = (matcher.candidates(camera_id, start_time, vector, exclude=exclude)
+                          + matcher.forward_candidates(tracklet_id, vector, exclude=exclude))
+        new_candidates.sort(key=lambda candidate: -candidate[1])
+        for other_id, score in new_candidates:
+            engine.add_match(tracklet_id, other_id, score)

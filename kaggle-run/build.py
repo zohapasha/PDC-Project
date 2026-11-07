@@ -20,9 +20,9 @@ import tarfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
-INCLUDE = ("argus/", "scripts/", "tests/", "configs/", "pyproject.toml", "requirements.txt")
+INCLUDED_PREFIXES = ("argus/", "scripts/", "tests/", "configs/", "pyproject.toml", "requirements.txt")
 
-MODES = {
+PIPELINE_ARGS_OF_MODE = {
     "smoke": "--split test --e1_scenes scene_061 --e4_scenes scene_061,scene_062 "
              "--e4_sites 1,2 --e4_seeds 0 --e4_speed 50",
     "full": "--split test --e1_scenes " + ",".join(f"scene_{i:03d}" for i in range(61, 71)) +
@@ -40,58 +40,60 @@ MODES = {
 
 
 # per-mode kernel settings: GPU, and earlier kernels whose output holds cached features
-SETTINGS = {"e4": {"gpu": False, "cache_from": ["argus-nvidia-mtmc-campus"]}}
+KERNEL_SETTINGS_OF_MODE = {"e4": {"gpu": False, "cache_from": ["argus-nvidia-mtmc-campus"]}}
 
 
-def git(*a):
-    return subprocess.run(["git", *a], cwd=ROOT, capture_output=True, text=True).stdout
+def git(*git_args):
+    return subprocess.run(["git", *git_args], cwd=ROOT, capture_output=True, text=True).stdout
 
 
 def bundle() -> str:
-    files = git("ls-files", "--cached", "--others", "--exclude-standard").split("\n")
-    files = sorted(f for f in files if f and f.startswith(INCLUDE) and os.path.isfile(
-        os.path.join(ROOT, f)) and not f.startswith("configs/generated/"))
-    buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode="w:gz") as t:
-        for f in files:
-            t.add(os.path.join(ROOT, f), arcname=f)
-    print(f"bundled {len(files)} files, {buf.tell() / 1024:.0f} KiB compressed")
-    return base64.b64encode(buf.getvalue()).decode()
+    paths = git("ls-files", "--cached", "--others", "--exclude-standard").split("\n")
+    paths = sorted(path for path in paths if path and path.startswith(INCLUDED_PREFIXES)
+                   and os.path.isfile(os.path.join(ROOT, path))
+                   and not path.startswith("configs/generated/"))
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w:gz") as archive:
+        for path in paths:
+            archive.add(os.path.join(ROOT, path), arcname=path)
+    print(f"bundled {len(paths)} files, {buffer.tell() / 1024:.0f} KiB compressed")
+    return base64.b64encode(buffer.getvalue()).decode()
 
 
 if __name__ == "__main__":
     mode = sys.argv[1] if len(sys.argv) > 1 else "smoke"
-    if mode not in MODES:
-        raise SystemExit(f"mode must be one of {list(MODES)}")
-    user = None
-    for p in ("~/.kaggle/kaggle.json", "~/.kaggle/credentials.json"):
-        p = os.path.expanduser(p)
-        if os.path.exists(p):
-            user = json.load(open(p)).get("username") or user
-    user = os.environ.get("KAGGLE_USERNAME", user)
-    if not user:
+    if mode not in PIPELINE_ARGS_OF_MODE:
+        raise SystemExit(f"mode must be one of {list(PIPELINE_ARGS_OF_MODE)}")
+    username = None
+    for credentials_path in ("~/.kaggle/kaggle.json", "~/.kaggle/credentials.json"):
+        credentials_path = os.path.expanduser(credentials_path)
+        if os.path.exists(credentials_path):
+            username = json.load(open(credentials_path)).get("username") or username
+    username = os.environ.get("KAGGLE_USERNAME", username)
+    if not username:
         raise SystemExit("no Kaggle username found (~/.kaggle/kaggle.json or KAGGLE_USERNAME)")
     commit = git("rev-parse", "--short", "HEAD").strip() or "nogit"
     if git("status", "--porcelain", "--", "argus", "scripts"):
         commit += "-dirty"
-    src = open(os.path.join(HERE, "run_template.py"), encoding="utf-8").read()
-    src = (src.replace("@@BUNDLE@@", bundle()).replace("@@GIT@@", commit)
-              .replace("@@MODE@@", mode).replace("@@ARGS@@", MODES[mode]))
-    st = SETTINGS.get(mode, {})
-    cache = [f"{user}/{k}" for k in st.get("cache_from", [])]
-    src = src.replace('"@@CACHE@@"', repr([k.split("/")[1] for k in cache]))
-    out = os.path.join(HERE, mode)
-    os.makedirs(out, exist_ok=True)
-    with open(os.path.join(out, "run.py"), "w", encoding="utf-8") as f:
-        f.write(src)
+    source = open(os.path.join(HERE, "run_template.py"), encoding="utf-8").read()
+    source = (source.replace("@@BUNDLE@@", bundle()).replace("@@GIT@@", commit)
+                    .replace("@@MODE@@", mode).replace("@@ARGS@@", PIPELINE_ARGS_OF_MODE[mode]))
+    settings = KERNEL_SETTINGS_OF_MODE.get(mode, {})
+    cache_kernels = [f"{username}/{slug}" for slug in settings.get("cache_from", [])]
+    source = source.replace('"@@CACHE@@"', repr([kernel.split("/")[1] for kernel in cache_kernels]))
+    output_dir = os.path.join(HERE, mode)
+    os.makedirs(output_dir, exist_ok=True)
+    with open(os.path.join(output_dir, "run.py"), "w", encoding="utf-8") as file:
+        file.write(source)
     slug = "argus-nvidia-mtmc" + ("" if mode == "full" else f"-{mode}")
-    meta = {"id": f"{user}/{slug}", "title": slug, "code_file": "run.py",
-            "language": "python", "kernel_type": "script", "is_private": True,
-            "enable_gpu": st.get("gpu", True), "enable_internet": True, "dataset_sources": [],
-            "competition_sources": [], "kernel_sources": cache, "model_sources": []}
-    with open(os.path.join(out, "kernel-metadata.json"), "w") as f:
-        json.dump(meta, f, indent=1)
-    print(f"wrote {out}/run.py and kernel-metadata.json (id {user}/{slug}, code {commit})")
-    print(f"next: kaggle kernels push -p {os.path.relpath(out, ROOT)}")
-    print(f"then: PYTHONUTF8=1 kaggle kernels output {user}/{slug} -p kaggle-run/output/{mode} "
+    metadata = {"id": f"{username}/{slug}", "title": slug, "code_file": "run.py",
+                "language": "python", "kernel_type": "script", "is_private": True,
+                "enable_gpu": settings.get("gpu", True), "enable_internet": True,
+                "dataset_sources": [], "competition_sources": [], "kernel_sources": cache_kernels,
+                "model_sources": []}
+    with open(os.path.join(output_dir, "kernel-metadata.json"), "w") as file:
+        json.dump(metadata, file, indent=1)
+    print(f"wrote {output_dir}/run.py and kernel-metadata.json (id {username}/{slug}, code {commit})")
+    print(f"next: kaggle kernels push -p {os.path.relpath(output_dir, ROOT)}")
+    print(f"then: PYTHONUTF8=1 kaggle kernels output {username}/{slug} -p kaggle-run/output/{mode} "
           r'--file-pattern "(results/|\.log$)"')

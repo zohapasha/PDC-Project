@@ -15,14 +15,15 @@ import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
 
-R = "results"
-FIG = os.path.join(R, "figures")
-TAB = os.path.join(R, "tables")
-os.makedirs(FIG, exist_ok=True)
-os.makedirs(TAB, exist_ok=True)
+RESULTS_DIR = "results"
+FIGURES_DIR = os.path.join(RESULTS_DIR, "figures")
+TABLES_DIR = os.path.join(RESULTS_DIR, "tables")
+os.makedirs(FIGURES_DIR, exist_ok=True)
+os.makedirs(TABLES_DIR, exist_ok=True)
 
 # validated categorical palette, fixed slot order, assigned per method (never cycled)
-STYLE = {
+# method -> (colour, marker, line style, label)
+METHOD_STYLE = {
     "ours":              ("#2a78d6", "o", "-",  "Ours"),
     "ours_two_level":    ("#2a78d6", "s", "--", "Ours (two-level, option b)"),
     "ours_two_level_b":  ("#2a78d6", "s", "--", "Ours (two-level, option b)"),
@@ -35,338 +36,362 @@ STYLE = {
     "B5_centralized":    ("#008300", "X", "-",  "B5 centralized"),
     "centralized":       ("#008300", "X", "-",  "Centralized (single instance)"),
 }
-INK, MUTED, GRID = "#1f1f1e", "#6b6a64", "#e4e3de"
+INK_COLOR, MUTED_COLOR, GRID_COLOR = "#1f1f1e", "#6b6a64", "#e4e3de"
 
 plt.rcParams.update({
     "font.family": "serif", "font.size": 8, "axes.titlesize": 8, "axes.labelsize": 8,
     "legend.fontsize": 7, "xtick.labelsize": 7, "ytick.labelsize": 7,
-    "axes.edgecolor": MUTED, "axes.labelcolor": INK, "xtick.color": MUTED, "ytick.color": MUTED,
-    "axes.grid": True, "grid.color": GRID, "grid.linewidth": 0.6, "axes.axisbelow": True,
-    "axes.spines.top": False, "axes.spines.right": False, "lines.linewidth": 1.4,
-    "lines.markersize": 4.5, "legend.frameon": False, "pdf.fonttype": 42, "savefig.bbox": "tight",
+    "axes.edgecolor": MUTED_COLOR, "axes.labelcolor": INK_COLOR, "xtick.color": MUTED_COLOR,
+    "ytick.color": MUTED_COLOR, "axes.grid": True, "grid.color": GRID_COLOR,
+    "grid.linewidth": 0.6, "axes.axisbelow": True, "axes.spines.top": False,
+    "axes.spines.right": False, "lines.linewidth": 1.4, "lines.markersize": 4.5,
+    "legend.frameon": False, "pdf.fonttype": 42, "savefig.bbox": "tight",
 })
-W1, W2 = 3.5, 7.16          # IEEE single / double column width (inches)
+SINGLE_COLUMN_WIDTH, DOUBLE_COLUMN_WIDTH = 3.5, 7.16   # IEEE column widths (inches)
+MIB = 2**20
 
 
-def load(name):
-    p = os.path.join(R, f"{name}.csv")
-    return pd.read_csv(p) if os.path.exists(p) else None
+def load_results(name):
+    path = os.path.join(RESULTS_DIR, f"{name}.csv")
+    return pd.read_csv(path) if os.path.exists(path) else None
 
 
-def line(ax, df, x, y, method, label=None):
-    c, m, ls, lab = STYLE[method]
-    g = df[df.method == method].groupby(x)[y].agg(["mean", "std"]).reset_index()
-    if g.empty:
+def plot_method_line(ax, results, x_column, y_column, method, label=None):
+    color, marker, line_style, default_label = METHOD_STYLE[method]
+    stats = results[results.method == method].groupby(x_column)[y_column].agg(["mean", "std"]).reset_index()
+    if stats.empty:
         return
-    ax.errorbar(g[x], g["mean"], yerr=g["std"].fillna(0), color=c, marker=m, ls=ls,
-                capsize=2, elinewidth=0.8, label=label or lab)
+    ax.errorbar(stats[x_column], stats["mean"], yerr=stats["std"].fillna(0), color=color,
+                marker=marker, ls=line_style, capsize=2, elinewidth=0.8, label=label or default_label)
 
 
-def save(fig, name):
-    fig.savefig(os.path.join(FIG, f"{name}.pdf"))
-    fig.savefig(os.path.join(FIG, f"{name}.png"), dpi=200)
+def save_figure(fig, name):
+    fig.savefig(os.path.join(FIGURES_DIR, f"{name}.pdf"))
+    fig.savefig(os.path.join(FIGURES_DIR, f"{name}.png"), dpi=200)
     plt.close(fig)
     print("  figure", name)
 
 
-def ms(series):
+def mean_std(series):
     return f"{series.mean():.3f} ± {series.std():.3f}"
 
 
 # ------------------------------------------------------------------------- E1 table
 def e1():
     for name in ("e1_accuracy", "e1_accuracy_hard"):
-        d = load(name)
-        if d is None:
+        results = load_results(name)
+        if results is None:
             continue
-        order = ["ours", "ours_two_level", "ours_two_level_a", "B1_offline", "B3_no_correction",
-                 "B4_no_constraints"]
-        cols = [("pw_f1", "Pairwise F1"), ("b3_f1", "B³ F1"), ("idf1", "IDF1"),
-                ("violations", "Violations"), ("agree_offline", "Agreement w/ B1")]
-        rows = []
-        for m in order:
-            s = d[d.method == m]
-            if s.empty:
+        method_order = ["ours", "ours_two_level", "ours_two_level_a", "B1_offline",
+                        "B3_no_correction", "B4_no_constraints"]
+        columns = [("pw_f1", "Pairwise F1"), ("b3_f1", "B³ F1"), ("idf1", "IDF1"),
+                   ("violations", "Violations"), ("agree_offline", "Agreement w/ B1")]
+        table_rows = []
+        for method in method_order:
+            method_results = results[results.method == method]
+            if method_results.empty:
                 continue
-            r = [STYLE[m][3]]
-            for c, _ in cols:
-                r.append(f"{s[c].mean():.1f} ± {s[c].std():.1f}" if c == "violations" else ms(s[c]))
-            rows.append(r)
-        hdr = ["Method"] + [c[1] for c in cols]
-        n = d.n_tracklets.mean()
-        with open(os.path.join(TAB, f"{name}.md"), "w", encoding="utf-8") as f:
-            f.write(f"{name}: {d.seed.nunique()} seeds, ~{n:,.0f} tracklets/run\n\n")
-            f.write("| " + " | ".join(hdr) + " |\n|" + "---|" * len(hdr) + "\n")
-            for r in rows:
-                f.write("| " + " | ".join(r) + " |\n")
-        with open(os.path.join(TAB, f"{name}.tex"), "w", encoding="utf-8") as f:
-            f.write("\\begin{tabular}{l" + "c" * len(cols) + "}\n\\toprule\n")
-            f.write(" & ".join(h.replace("³", "$^3$") for h in hdr) + " \\\\\n\\midrule\n")
-            for r in rows:
-                f.write(" & ".join(x.replace("±", "$\\pm$") for x in r) + " \\\\\n")
-            f.write("\\bottomrule\n\\end{tabular}\n")
+            cells = [METHOD_STYLE[method][3]]
+            for column, _ in columns:
+                values = method_results[column]
+                cells.append(f"{values.mean():.1f} ± {values.std():.1f}" if column == "violations"
+                             else mean_std(values))
+            table_rows.append(cells)
+        header = ["Method"] + [title for _, title in columns]
+        mean_tracklets = results.n_tracklets.mean()
+        with open(os.path.join(TABLES_DIR, f"{name}.md"), "w", encoding="utf-8") as file:
+            file.write(f"{name}: {results.seed.nunique()} seeds, ~{mean_tracklets:,.0f} tracklets/run\n\n")
+            file.write("| " + " | ".join(header) + " |\n|" + "---|" * len(header) + "\n")
+            for cells in table_rows:
+                file.write("| " + " | ".join(cells) + " |\n")
+        with open(os.path.join(TABLES_DIR, f"{name}.tex"), "w", encoding="utf-8") as file:
+            file.write("\\begin{tabular}{l" + "c" * len(columns) + "}\n\\toprule\n")
+            file.write(" & ".join(title.replace("³", "$^3$") for title in header) + " \\\\\n\\midrule\n")
+            for cells in table_rows:
+                file.write(" & ".join(cell.replace("±", "$\\pm$") for cell in cells) + " \\\\\n")
+            file.write("\\bottomrule\n\\end{tabular}\n")
         print("  table", name)
 
 
 # ------------------------------------------------------------------------- E2
 def e2():
-    d = load("e2_incremental")
-    if d is None:
+    results = load_results("e2_incremental")
+    if results is None:
         return
-    fig, ax = plt.subplots(figsize=(W1, 2.3))
-    line(ax, d, "n_tracklets", "update_ms_p50", "ours", "Ours, p50 per update")
-    c, m, _, _ = STYLE["ours"]
-    g = d[d.method == "ours"].groupby("n_tracklets")["update_ms_p99"].agg(["mean", "std"])
-    ax.errorbar(g.index, g["mean"], yerr=g["std"].fillna(0), color=c, marker=m, ls="--",
-                mfc="white", capsize=2, elinewidth=0.8, label="Ours, p99 per update")
-    line(ax, d, "n_tracklets", "update_ms_p50", "B1_full_recompute", "B1, one full recompute")
-    ax.set_xscale("log"); ax.set_yscale("log")
+    fig, ax = plt.subplots(figsize=(SINGLE_COLUMN_WIDTH, 2.3))
+    plot_method_line(ax, results, "n_tracklets", "update_ms_p50", "ours", "Ours, p50 per update")
+    color, marker, _, _ = METHOD_STYLE["ours"]
+    p99 = results[results.method == "ours"].groupby("n_tracklets")["update_ms_p99"].agg(["mean", "std"])
+    ax.errorbar(p99.index, p99["mean"], yerr=p99["std"].fillna(0), color=color, marker=marker,
+                ls="--", mfc="white", capsize=2, elinewidth=0.8, label="Ours, p99 per update")
+    plot_method_line(ax, results, "n_tracklets", "update_ms_p50", "B1_full_recompute",
+                     "B1, one full recompute")
+    ax.set_xscale("log")
+    ax.set_yscale("log")
     ax.set_xlabel("Tracklets processed (graph size)")
     ax.set_ylabel("Update latency (ms)")
     ax.legend(loc="upper left")
-    save(fig, "fig_e2_incremental")
+    save_figure(fig, "fig_e2_incremental")
 
 
 # ------------------------------------------------------------------------- E3
 def e3():
-    d = load("e3_corrections")
-    files = sorted(glob.glob(os.path.join(R, "e3_ops_e3_corrections_*.parquet")))
-    if d is None or not files:
+    summary = load_results("e3_corrections")
+    op_files = sorted(glob.glob(os.path.join(RESULTS_DIR, "e3_ops_e3_corrections_*.parquet")))
+    if summary is None or not op_files:
         return
-    ops = pd.concat([pd.read_parquet(f) for f in files])
-    corr = ops[ops.kind.isin(["conflict_ok", "del_tree"])]
-    fig, axs = plt.subplots(1, 2, figsize=(W2 * 0.75, 2.3))
-    ax = axs[0]
-    for m in ("B2_component", "ours"):
-        s = corr[corr.method == m]
-        s = s.sample(min(len(s), 4000), random_state=0)
-        c, mk, _, lab = STYLE[m]
-        ax.scatter(s.person_size, s.touched, s=7, color=c, marker=mk, alpha=0.45,
-                   edgecolors="none", label=lab)
-    lim = max(corr.person_size.max(), corr.touched.max())
-    ax.plot([1, lim], [1, lim], color=MUTED, lw=0.8, ls=":", label="touched = person size")
-    ax.set_xscale("log"); ax.set_yscale("log")
+    ops = pd.concat([pd.read_parquet(path) for path in op_files])
+    corrections = ops[ops.kind.isin(["conflict_ok", "del_tree"])]
+    fig, axes = plt.subplots(1, 2, figsize=(DOUBLE_COLUMN_WIDTH * 0.75, 2.3))
+    ax = axes[0]
+    for method in ("B2_component", "ours"):
+        sample = corrections[corrections.method == method]
+        sample = sample.sample(min(len(sample), 4000), random_state=0)
+        color, marker, _, label = METHOD_STYLE[method]
+        ax.scatter(sample.person_size, sample.touched, s=7, color=color, marker=marker, alpha=0.45,
+                   edgecolors="none", label=label)
+    axis_limit = max(corrections.person_size.max(), corrections.touched.max())
+    ax.plot([1, axis_limit], [1, axis_limit], color=MUTED_COLOR, lw=0.8, ls=":",
+            label="touched = person size")
+    ax.set_xscale("log")
+    ax.set_yscale("log")
     ax.set_xlabel("Size of the person(s) involved")
     ax.set_ylabel("Vertices touched per correction")
     ax.legend(loc="upper left", markerscale=1.5)
-    ax = axs[1]
-    for m in ("ours", "B2_component"):
-        s = np.sort(corr[corr.method == m].latency_us.values)
-        c, _, ls, lab = STYLE[m]
-        ax.plot(s, np.arange(1, len(s) + 1) / len(s), color=c, ls=ls, label=lab)
+    ax = axes[1]
+    for method in ("ours", "B2_component"):
+        latencies = np.sort(corrections[corrections.method == method].latency_us.values)
+        color, _, line_style, label = METHOD_STYLE[method]
+        ax.plot(latencies, np.arange(1, len(latencies) + 1) / len(latencies), color=color,
+                ls=line_style, label=label)
     ax.set_xscale("log")
     ax.set_xlabel("Correction latency (µs)")
     ax.set_ylabel("CDF")
     ax.legend(loc="upper left")
-    save(fig, "fig_e3_corrections")
-    cols = ["n_corrections", "n_conflict_ok", "n_conflict_rej", "n_deletions", "frac_del_hit_backup",
-            "frac_treedel_repaired_by_backup", "touched_mean", "touched_over_size_max", "msgs_mean",
-            "corr_us_p50", "corr_us_p99", "tree_depth_mean", "tree_depth_max", "pw_f1"]
-    g = d.groupby("method")[cols].mean().T
-    g.to_csv(os.path.join(TAB, "e3_summary.csv"))
-    with open(os.path.join(TAB, "e3_summary.md"), "w", encoding="utf-8") as f:
-        f.write(g.to_string(float_format=lambda v: f"{v:.4g}"))
+    save_figure(fig, "fig_e3_corrections")
+    columns = ["n_corrections", "n_conflict_ok", "n_conflict_rej", "n_deletions", "frac_del_hit_backup",
+               "frac_treedel_repaired_by_backup", "touched_mean", "touched_over_size_max", "msgs_mean",
+               "corr_us_p50", "corr_us_p99", "tree_depth_mean", "tree_depth_max", "pw_f1"]
+    means = summary.groupby("method")[columns].mean().T
+    means.to_csv(os.path.join(TABLES_DIR, "e3_summary.csv"))
+    with open(os.path.join(TABLES_DIR, "e3_summary.md"), "w", encoding="utf-8") as file:
+        file.write(means.to_string(float_format=lambda value: f"{value:.4g}"))
     print("  table e3_summary")
 
 
 # ------------------------------------------------------------------------- E4
 def e4():
     for kind in ("weak", "strong"):
-        d = load(f"e4_{kind}")
-        if d is None:
+        results = load_results(f"e4_{kind}")
+        if results is None:
             continue
-        fig, axs = plt.subplots(1, 3, figsize=(W2, 2.2))
-        mx, fx = d[d.load == "max"], d[d.load == "fixed"]
-        for m in ("ours", "B5_centralized"):
-            line(axs[0], mx, "n_sites", "throughput_ev_s", m)
-            line(axs[1], fx, "n_sites", "e2e_ms_p99", m)
-            line(axs[2], mx, "n_sites", "hub_cpu_util", m)
-        axs[0].set_ylabel("Max throughput (events/s)")
-        axs[1].set_ylabel("End-to-end p99 latency (ms)\nat fixed load")
-        axs[1].set_yscale("log")
-        axs[2].set_ylabel("Hub CPU utilisation\nat max load")
-        for ax in axs:
+        fig, axes = plt.subplots(1, 3, figsize=(DOUBLE_COLUMN_WIDTH, 2.2))
+        max_load, fixed_load = results[results.load == "max"], results[results.load == "fixed"]
+        for method in ("ours", "B5_centralized"):
+            plot_method_line(axes[0], max_load, "n_sites", "throughput_ev_s", method)
+            plot_method_line(axes[1], fixed_load, "n_sites", "e2e_ms_p99", method)
+            plot_method_line(axes[2], max_load, "n_sites", "hub_cpu_util", method)
+        axes[0].set_ylabel("Max throughput (events/s)")
+        axes[1].set_ylabel("End-to-end p99 latency (ms)\nat fixed load")
+        axes[1].set_yscale("log")
+        axes[2].set_ylabel("Hub CPU utilisation\nat max load")
+        for ax in axes:
             ax.set_xlabel("Sites (processes)")
-            ax.set_xticks(sorted(d.n_sites.unique()))
-        h, l = axs[0].get_legend_handles_labels()
+            ax.set_xticks(sorted(results.n_sites.unique()))
+        handles, labels = axes[0].get_legend_handles_labels()
         fig.tight_layout(rect=(0, 0, 1, 0.9))
-        fig.legend(h, l, loc="upper center", ncol=2, bbox_to_anchor=(0.5, 1.0))
-        save(fig, f"fig_e4_{kind}")
+        fig.legend(handles, labels, loc="upper center", ncol=2, bbox_to_anchor=(0.5, 1.0))
+        save_figure(fig, f"fig_e4_{kind}")
 
 
 # ------------------------------------------------------------------------- E5
 def e5():
-    d = load("e5_bytes")
-    if d is None:
+    results = load_results("e5_bytes")
+    if results is None:
         return
-    types = [c for c in d.columns if c.startswith("bytes_")]
-    g = d.groupby("method")[types + ["total_bytes", "staleness_s"]].mean()
-    order = [m for m in ["ours", "B5_centralized", "B6_periodic_T1", "B6_periodic_T5", "B6_periodic_T30"] if m in g.index]
-    g = g.loc[order]
-    names = {"ours": "Ours\n(deltas)", "B5_centralized": "B5\ncentralized",
-             "B6_periodic_T1": "B6\nT=1 s", "B6_periodic_T5": "B6\nT=5 s", "B6_periodic_T30": "B6\nT=30 s"}
+    byte_columns = [column for column in results.columns if column.startswith("bytes_")]
+    means = results.groupby("method")[byte_columns + ["total_bytes", "staleness_s"]].mean()
+    method_order = [method for method in ["ours", "B5_centralized", "B6_periodic_T1",
+                                          "B6_periodic_T5", "B6_periodic_T30"] if method in means.index]
+    means = means.loc[method_order]
+    short_names = {"ours": "Ours\n(deltas)", "B5_centralized": "B5\ncentralized",
+                   "B6_periodic_T1": "B6\nT=1 s", "B6_periodic_T5": "B6\nT=5 s",
+                   "B6_periodic_T30": "B6\nT=30 s"}
     # message types: fixed colour per type (slot order), legend + table view in CSV
-    tcol = {"bytes_BorderTracklet": "#2a78d6", "bytes_BorderRevise": "#eb6834",
-            "bytes_TrackletRecord": "#1baf7a", "bytes_EdgeAdd": "#eda100", "bytes_EdgeDel": "#e87ba4",
-            "bytes_FullTracklet": "#008300", "bytes_FullRevise": "#6250d6", "bytes_SiteTable": "#e34948",
-            "bytes_SplitRequest": "#8a5a00"}
-    fig, axs = plt.subplots(1, 2, figsize=(W2, 2.3), gridspec_kw={"width_ratios": [2, 2]})
-    ax = axs[0]
+    message_type_color = {
+        "bytes_BorderTracklet": "#2a78d6", "bytes_BorderRevise": "#eb6834",
+        "bytes_TrackletRecord": "#1baf7a", "bytes_EdgeAdd": "#eda100", "bytes_EdgeDel": "#e87ba4",
+        "bytes_FullTracklet": "#008300", "bytes_FullRevise": "#6250d6", "bytes_SiteTable": "#e34948",
+        "bytes_SplitRequest": "#8a5a00"}
+    fig, axes = plt.subplots(1, 2, figsize=(DOUBLE_COLUMN_WIDTH, 2.3),
+                             gridspec_kw={"width_ratios": [2, 2]})
+    ax = axes[0]
     # composition panel: ours, B5 and the cheapest B6; all B6 periods are on the right panel
-    gb = g.loc[[m for m in ["ours", "B5_centralized", "B6_periodic_T30"] if m in g.index]]
-    x = np.arange(len(gb))
-    bottom = np.zeros(len(gb))
-    for t in [t for t in tcol if t in gb.columns]:
-        v = gb[t].fillna(0).values / 2**20
-        if v.sum() == 0:
+    composition = means.loc[[method for method in ["ours", "B5_centralized", "B6_periodic_T30"]
+                             if method in means.index]]
+    bar_positions = np.arange(len(composition))
+    bar_bottom = np.zeros(len(composition))
+    for column in [column for column in message_type_color if column in composition.columns]:
+        mib = composition[column].fillna(0).values / MIB
+        if mib.sum() == 0:
             continue
-        ax.bar(x, v, bottom=bottom, color=tcol[t], width=0.62, edgecolor="white", linewidth=1,
-               label=t.replace("bytes_", ""))
-        bottom += v
-    for i, tot in enumerate(bottom):
-        ax.text(i, tot * 1.04, f"{tot:.1f}", ha="center", va="bottom", fontsize=6.5, color=INK)
-    ax.set_xticks(x, [names[m] for m in gb.index])
+        ax.bar(bar_positions, mib, bottom=bar_bottom, color=message_type_color[column], width=0.62,
+               edgecolor="white", linewidth=1, label=column.replace("bytes_", ""))
+        bar_bottom += mib
+    for position, total in enumerate(bar_bottom):
+        ax.text(position, total * 1.04, f"{total:.1f}", ha="center", va="bottom", fontsize=6.5,
+                color=INK_COLOR)
+    ax.set_xticks(bar_positions, [short_names[method] for method in composition.index])
     ax.set_ylabel("Data sent to hub (MiB)")
     ax.legend(fontsize=6, ncol=1, loc="upper left", bbox_to_anchor=(1.0, 1.0))
-    ax.set_ylim(0, bottom.max() * 1.15)
-    ax = axs[1]
-    b6 = g[g.index.str.startswith("B6")]
-    ax.plot(b6.total_bytes / 2**20, b6.staleness_s, color="#6250d6", marker="o", label="B6 periodic sync")
-    for m, r in b6.iterrows():
-        ax.annotate(names[m].replace("\n", " "), (r.total_bytes / 2**20, r.staleness_s),
-                    textcoords="offset points", xytext=(4, 3), fontsize=6, color=MUTED)
-    st = g.loc["ours", "staleness_s"]
-    e4s = load("e4_strong")            # ours: staleness = measured end-to-end delivery latency
-    if e4s is not None:
-        q = e4s[(e4s.method == "ours") & (e4s.load == "fixed")]
-        if not q.empty:
-            st = q.e2e_ms_p50.mean() / 1e3
-    ax.scatter([g.loc["ours", "total_bytes"] / 2**20], [st],
-               color=STYLE["ours"][0], marker="o", zorder=3, label="Ours (deltas)")
+    ax.set_ylim(0, bar_bottom.max() * 1.15)
+    ax = axes[1]
+    periodic = means[means.index.str.startswith("B6")]
+    ax.plot(periodic.total_bytes / MIB, periodic.staleness_s, color="#6250d6", marker="o",
+            label="B6 periodic sync")
+    for method, row in periodic.iterrows():
+        ax.annotate(short_names[method].replace("\n", " "), (row.total_bytes / MIB, row.staleness_s),
+                    textcoords="offset points", xytext=(4, 3), fontsize=6, color=MUTED_COLOR)
+    our_staleness = means.loc["ours", "staleness_s"]
+    e4_strong = load_results("e4_strong")   # ours: staleness = measured end-to-end delivery latency
+    if e4_strong is not None:
+        fixed_load_ours = e4_strong[(e4_strong.method == "ours") & (e4_strong.load == "fixed")]
+        if not fixed_load_ours.empty:
+            our_staleness = fixed_load_ours.e2e_ms_p50.mean() / 1e3
+    ax.scatter([means.loc["ours", "total_bytes"] / MIB], [our_staleness],
+               color=METHOD_STYLE["ours"][0], marker="o", zorder=3, label="Ours (deltas)")
     ax.set_xscale("log")
     ax.set_xlabel("Data sent to hub (MiB, log)")
     ax.set_ylabel("Mean staleness at hub (s)")
     ax.legend(loc="upper right")
     fig.tight_layout()
-    save(fig, "fig_e5_bytes")
-    g.to_csv(os.path.join(TAB, "e5_bytes.csv"))
+    save_figure(fig, "fig_e5_bytes")
+    means.to_csv(os.path.join(TABLES_DIR, "e5_bytes.csv"))
 
 
 # ------------------------------------------------------------------------- E6
 def e6():
-    d = load("e6_noise")
-    if d is None:
+    results = load_results("e6_noise")
+    if results is None:
         return
-    fig, axs = plt.subplots(1, 2, figsize=(W2 * 0.75, 2.2))
-    for m in ("ours", "B3_no_correction", "B4_no_constraints"):
-        line(axs[0], d, "sigma", "pw_f1", m)
-    axs[0].set_xlabel("Re-ID noise σ"); axs[0].set_ylabel("Pairwise F1")
-    axs[0].legend(loc="lower left")
-    line(axs[1], d, "sigma", "corrections_per_min", "ours")
-    axs[1].set_xlabel("Re-ID noise σ"); axs[1].set_ylabel("Corrections per minute (ours)")
+    fig, axes = plt.subplots(1, 2, figsize=(DOUBLE_COLUMN_WIDTH * 0.75, 2.2))
+    for method in ("ours", "B3_no_correction", "B4_no_constraints"):
+        plot_method_line(axes[0], results, "sigma", "pw_f1", method)
+    axes[0].set_xlabel("Re-ID noise σ")
+    axes[0].set_ylabel("Pairwise F1")
+    axes[0].legend(loc="lower left")
+    plot_method_line(axes[1], results, "sigma", "corrections_per_min", "ours")
+    axes[1].set_xlabel("Re-ID noise σ")
+    axes[1].set_ylabel("Corrections per minute (ours)")
     fig.tight_layout()
-    save(fig, "fig_e6_noise")
+    save_figure(fig, "fig_e6_noise")
 
 
 # ------------------------------------------------------------------------- E7
 def e7():
-    d = load("e7_cross")
-    if d is None:
+    results = load_results("e7_cross")
+    if results is None:
         return
-    fig, axs = plt.subplots(1, 2, figsize=(W2 * 0.75, 2.2))
-    for m in ("ours_two_level", "ours_two_level_a"):
-        line(axs[0], d, "p_cross", "agree_centralized", m)
-    axs[0].set_ylabel("Agreement with centralized\n(pairwise F1)")
-    for m in ("centralized", "ours_two_level", "ours_two_level_a"):
-        line(axs[1], d, "p_cross", "pw_f1", m)
-    axs[1].set_ylabel("Pairwise F1 vs ground truth")
-    for ax in axs:
+    fig, axes = plt.subplots(1, 2, figsize=(DOUBLE_COLUMN_WIDTH * 0.75, 2.2))
+    for method in ("ours_two_level", "ours_two_level_a"):
+        plot_method_line(axes[0], results, "p_cross", "agree_centralized", method)
+    axes[0].set_ylabel("Agreement with centralized\n(pairwise F1)")
+    for method in ("centralized", "ours_two_level", "ours_two_level_a"):
+        plot_method_line(axes[1], results, "p_cross", "pw_f1", method)
+    axes[1].set_ylabel("Pairwise F1 vs ground truth")
+    for ax in axes:
         ax.set_xlabel("Cross-site movement probability")
-    h, l = axs[1].get_legend_handles_labels()
+    handles, labels = axes[1].get_legend_handles_labels()
     fig.tight_layout(rect=(0, 0, 1, 0.88))
-    fig.legend(h, l, loc="upper center", ncol=3, bbox_to_anchor=(0.5, 1.0))
-    save(fig, "fig_e7_cross")
+    fig.legend(handles, labels, loc="upper center", ncol=3, bbox_to_anchor=(0.5, 1.0))
+    save_figure(fig, "fig_e7_cross")
 
 
 # ------------------------------------------------------------------------- E9
 def e9():
     for name in ("e9_radius", "e9_radius_hard"):
-        d = load(name)
-        if d is not None:
-            _e9(d, name)
+        results = load_results(name)
+        if results is not None:
+            _plot_radius_sweep(results, name)
 
 
-def _e9(d, name):
-    fig, axs = plt.subplots(1, 2, figsize=(W2 * 0.75, 2.3))
-    b = d[d.method == "ours_two_level_b"].groupby("radius")[["total_bytes", "pw_f1", "agree_centralized"]]
-    g, e = b.mean(), b.std().fillna(0)
-    c, mk, ls, lab = STYLE["ours_two_level_b"]
-    for ax, y, yl in ((axs[0], "pw_f1", "Pairwise F1 vs ground truth"),
-                      (axs[1], "agree_centralized", "Agreement with centralized")):
-        ax.errorbar(g.total_bytes / 2**20, g[y], yerr=e[y], color=c, marker=mk, ls=ls, capsize=2,
-                    elinewidth=0.8, label=lab + ", radius sweep")
-        for r, row in g.iterrows():
-            txt = "all" if r >= 1e8 else f"{r:g} s"
-            ax.annotate(txt, (row.total_bytes / 2**20, row[y]), textcoords="offset points",
-                        xytext=(3, -9), fontsize=6, color=MUTED)
-        for m in ("ours_two_level_a", "centralized"):
-            q = d[d.method == m]
-            if q.empty or (m == "centralized" and y == "agree_centralized"):
+def _plot_radius_sweep(results, name):
+    fig, axes = plt.subplots(1, 2, figsize=(DOUBLE_COLUMN_WIDTH * 0.75, 2.3))
+    by_radius = results[results.method == "ours_two_level_b"].groupby("radius")[
+        ["total_bytes", "pw_f1", "agree_centralized"]]
+    means, stds = by_radius.mean(), by_radius.std().fillna(0)
+    color, marker, line_style, label = METHOD_STYLE["ours_two_level_b"]
+    for ax, y_column, y_label in ((axes[0], "pw_f1", "Pairwise F1 vs ground truth"),
+                                  (axes[1], "agree_centralized", "Agreement with centralized")):
+        ax.errorbar(means.total_bytes / MIB, means[y_column], yerr=stds[y_column], color=color,
+                    marker=marker, ls=line_style, capsize=2, elinewidth=0.8,
+                    label=label + ", radius sweep")
+        for radius, row in means.iterrows():
+            radius_text = "all" if radius >= 1e8 else f"{radius:g} s"
+            ax.annotate(radius_text, (row.total_bytes / MIB, row[y_column]),
+                        textcoords="offset points", xytext=(3, -9), fontsize=6, color=MUTED_COLOR)
+        for method in ("ours_two_level_a", "centralized"):
+            reference = results[results.method == method]
+            if reference.empty or (method == "centralized" and y_column == "agree_centralized"):
                 continue
-            cc, mm, _, ll = STYLE[m]
-            ax.errorbar([q.total_bytes.mean() / 2**20], [q[y].mean()], yerr=[q[y].std()],
-                        color=cc, marker=mm, ls="none", capsize=2, label=ll + (" (B5 bytes)" if m == "centralized" else ""))
+            ref_color, ref_marker, _, ref_label = METHOD_STYLE[method]
+            ax.errorbar([reference.total_bytes.mean() / MIB], [reference[y_column].mean()],
+                        yerr=[reference[y_column].std()], color=ref_color, marker=ref_marker,
+                        ls="none", capsize=2,
+                        label=ref_label + (" (B5 bytes)" if method == "centralized" else ""))
         ax.set_xlabel("Data sent site ↔ hub (MiB)")
-        ax.set_ylabel(yl)
-    h, l = axs[0].get_legend_handles_labels()
+        ax.set_ylabel(y_label)
+    handles, labels = axes[0].get_legend_handles_labels()
     fig.tight_layout(rect=(0, 0, 1, 0.86))
-    fig.legend(h, l, loc="upper center", ncol=3, bbox_to_anchor=(0.5, 1.0))
-    save(fig, f"fig_{name}")
-    tab = d.groupby(["method", "radius"], dropna=False)[["vector_cams", "total_bytes", "pw_f1", "idf1",
-                                                          "agree_centralized", "split_requests"]].mean()
-    tab.to_csv(os.path.join(TAB, f"{name}.csv"))
+    fig.legend(handles, labels, loc="upper center", ncol=3, bbox_to_anchor=(0.5, 1.0))
+    save_figure(fig, f"fig_{name}")
+    table = results.groupby(["method", "radius"], dropna=False)[
+        ["vector_cams", "total_bytes", "pw_f1", "idf1", "agree_centralized", "split_requests"]].mean()
+    table.to_csv(os.path.join(TABLES_DIR, f"{name}.csv"))
 
 
 # ------------------------------------------------------------------------- E8 / E4 / real-data tables
-def _md(g, name):
-    g.to_csv(os.path.join(TAB, f"{name}.csv"))
-    with open(os.path.join(TAB, f"{name}.md"), "w", encoding="utf-8") as f:
-        f.write(g.to_string(float_format=lambda v: f"{v:.4g}"))
+def _write_table(table, name):
+    table.to_csv(os.path.join(TABLES_DIR, f"{name}.csv"))
+    with open(os.path.join(TABLES_DIR, f"{name}.md"), "w", encoding="utf-8") as file:
+        file.write(table.to_string(float_format=lambda value: f"{value:.4g}"))
     print("  table", name)
 
 
 def e8():
-    d = load("e8_neo4j")
-    if d is None:
+    results = load_results("e8_neo4j")
+    if results is None:
         return
-    cols = ["n_deltas", "deltas_per_stream_s", "sink_deltas_per_s", "headroom",
-            "flush_ms_p50", "flush_ms_p95", "flush_ms_p99", "graph_equals_hub"]
-    g = d.groupby("batch")[cols].agg(["mean", "std"])
-    g.columns = [f"{a}_{b}" for a, b in g.columns]
-    _md(g, "e8_neo4j")
+    columns = ["n_deltas", "deltas_per_stream_s", "sink_deltas_per_s", "headroom",
+               "flush_ms_p50", "flush_ms_p95", "flush_ms_p99", "graph_equals_hub"]
+    table = results.groupby("batch")[columns].agg(["mean", "std"])
+    table.columns = [f"{column}_{statistic}" for column, statistic in table.columns]
+    _write_table(table, "e8_neo4j")
 
 
-def e4_tab():
+def e4_table():
     for kind in ("weak", "strong"):
-        d = load(f"e4_{kind}")
-        if d is None:
+        results = load_results(f"e4_{kind}")
+        if results is None:
             continue
-        cols = ["throughput_ev_s", "e2e_ms_p50", "e2e_ms_p99", "hub_cpu_util", "hub_msgs", "split_requests"]
-        _md(d.groupby(["load", "method", "n_sites"])[cols].mean(), f"e4_{kind}")
+        columns = ["throughput_ev_s", "e2e_ms_p50", "e2e_ms_p99", "hub_cpu_util", "hub_msgs",
+                   "split_requests"]
+        _write_table(results.groupby(["load", "method", "n_sites"])[columns].mean(), f"e4_{kind}")
 
 
-def real():
-    d = load("real_wildtrack")
-    if d is None:
+def real_data_table():
+    results = load_results("real_wildtrack")
+    if results is None:
         return
-    cols = [c for c in ["pw_f1", "pw_p", "pw_r", "b3_f1", "idf1", "violations", "agree_centralized"] if c in d.columns]
-    _md(d.groupby("method")[cols].mean(), "real_wildtrack")
+    columns = [column for column in ["pw_f1", "pw_p", "pw_r", "b3_f1", "idf1", "violations",
+                                     "agree_centralized"] if column in results.columns]
+    _write_table(results.groupby("method")[columns].mean(), "real_wildtrack")
 
 
 if __name__ == "__main__":
     sys.stdout.reconfigure(encoding="utf-8")
-    for f in (e1, e2, e3, e4, e4_tab, e5, e6, e7, e8, e9, real):
+    for make in (e1, e2, e3, e4, e4_table, e5, e6, e7, e8, e9, real_data_table):
         try:
-            f()
-        except Exception as ex:          # one broken figure should not block the others
-            print(f"  {f.__name__} failed: {ex!r}")
+            make()
+        except Exception as error:          # one broken figure should not block the others
+            print(f"  {make.__name__} failed: {error!r}")
